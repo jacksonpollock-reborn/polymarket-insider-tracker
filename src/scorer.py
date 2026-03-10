@@ -226,14 +226,18 @@ def score_wallet(
     # ── Build active positions summary ────────────────────────────────────────
     active_positions = []
     for t in recent_trades:
+        side    = (t.get("side") or "BUY").upper()         # BUY or SELL
+        outcome = t.get("outcome") or t.get("name") or ""  # e.g. "Overpass", "Yes", "No"
         active_positions.append({
             "market_name":      t.get("_market_name", "Unknown"),
             "market_address":   t.get("_market_address", ""),
-            "side":             (t.get("side") or t.get("outcome") or "?").upper(),
+            "side":             side,
+            "outcome":          outcome,   # ← specific position purchased
             "amount_usdc":      float(t.get("usdcSize") or t.get("size") or 0),
             "entry_price":      float(t.get("price") or 0),
             "market_liquidity": float(t.get("_market_liquidity") or 0),
             "market_end":       t.get("_market_end"),
+            "days_to_end":      t.get("_days_to_end"),
             "spike_ratio":      t.get("_spike_ratio", 0),
         })
 
