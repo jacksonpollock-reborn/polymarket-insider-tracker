@@ -1,16 +1,6 @@
 """
 fetchers.py — All external API calls in one place.
-Each function returns None/empty on failure so the scorer degrades gracefully.
-
-Endpoint status (verified 2026-03):
-  ✅ gamma-api.polymarket.com/markets          — public, no auth
-  ✅ gamma-api.polymarket.com/positions        — public, needs market_id (numeric)
-  ✅ data-api.polymarket.com/activity          — public, needs ?user=ADDRESS
-  ✅ data-api.polymarket.com/positions         — public, needs ?user=ADDRESS
-  ✅ api.polygonscan.com                       — needs API key
-  ✅ api.arkhamintelligence.com                — needs API key
-  ❌ clob.polymarket.com/trades                — requires auth (401)
-  ❌ dune.com query creation                   — paid plan only (403)
+Verified working endpoints as of 2026-03.
 """
 
 import os
@@ -73,22 +63,21 @@ def fetch_active_markets(limit=150):
     return markets[:limit]
 
 
-def fetch_market_top_holders(market_id, limit=50):
+# ── Trades per market ──────────────────────────────────────────────────────────
+
+def fetch_market_trades(condition_id, limit=100):
     """
-    Top position holders for a market.
-    market_id: numeric 'id' from markets API (NOT conditionId).
+    Fetch recent trades for a market via data-api /trades.
+    Returns list of trade dicts with keys:
+      proxyWallet, side, size, price, outcome, timestamp, title, conditionId
+    Note: size is share quantity. USDC value = size * price.
     """
-    result = _get(f"{GAMMA_API}/positions", params={
-        "market_id": market_id,
-        "limit": limit,
-        "sortBy": "currentValue",
-        "order": "DESC",
-    })
+    result = _get(f"{DATA_API}/trades", params={"market": condition_id, "limit": limit})
     time.sleep(0.15)
     if isinstance(result, list):
         return result
     if isinstance(result, dict):
-        return result.get("data") or result.get("positions") or []
+        return result.get("data") or result.get("results") or []
     return []
 
 
@@ -131,7 +120,6 @@ def fetch_dune_new_large_bettors():
 
 def fetch_polygon_tx_history(address):
     empty = {"tx_count": 0, "first_tx_timestamp": None, "usdc_inflows": [], "funding_flags": []}
-
     if not POLYGONSCAN_KEY:
         log.warning("[Polygonscan] No API key — skipping")
         return empty
@@ -143,7 +131,6 @@ def fetch_polygon_tx_history(address):
         "address": address, "sort": "asc",
         "apikey": POLYGONSCAN_KEY,
     })
-
     if not transfers or transfers.get("status") != "1":
         return empty
 
@@ -155,20 +142,16 @@ def fetch_polygon_tx_history(address):
         "usdc_inflows":       [],
         "funding_flags":      [],
     }
-
     for tx in inflows:
         from_addr  = tx.get("from", "").lower()
         value_usdc = int(tx.get("value", 0)) / 1e6
         ts         = int(tx.get("timeStamp", 0))
         result["usdc_inflows"].append({"from": from_addr, "value_usdc": value_usdc, "timestamp": ts})
-
         if any(from_addr.startswith(m) for m in KNOWN_MIXER_PREFIXES):
             result["funding_flags"].append(f"⚠️ Funded by known mixer: {from_addr[:12]}…")
-
         bridge_prefixes = ["0x7ceb", "0x2c0", "0x8484", "0x40ec"]
         if any(from_addr.startswith(p) for p in bridge_prefixes):
             result["funding_flags"].append(f"🌉 Bridged USDC from external chain (${value_usdc:,.0f})")
-
     return result
 
 
@@ -178,14 +161,11 @@ def fetch_arkham_entity(address):
     if not ARKHAM_KEY:
         log.warning("[Arkham] No API key — skipping")
         return {}
-
     headers = {"API-Key": ARKHAM_KEY}
     data    = _get(f"{ARKHAM_API}/intelligence/address/{address}", headers=headers)
     time.sleep(0.25)
-
     if not data:
         return {}
-
     entity = data.get("arkhamEntity") or {}
     return {
         "label":             entity.get("name") or "Unknown",
