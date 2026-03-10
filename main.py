@@ -8,7 +8,7 @@ import logging
 import os
 import sys
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 # Allow running from project root
 sys.path.insert(0, os.path.dirname(__file__))
@@ -39,9 +39,23 @@ MAX_WALLETS_TO_SCORE = int(os.environ.get("MAX_WALLETS_TO_SCORE", "60"))
 
 
 def flag_suspicious_markets(markets: list[dict]) -> list[dict]:
+    now     = datetime.now(timezone.utc)
+    cutoff  = now + timedelta(days=30)   # only keep markets resolving within 30 days
     flagged = []
+
     for m in markets:
         try:
+            # ── Resolution date filter ─────────────────────────────────────────
+            end_raw = m.get("endDateIso") or m.get("endDate")
+            if not end_raw:
+                continue
+            end_dt = datetime.fromisoformat(str(end_raw).replace("Z", "+00:00"))
+            if end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=timezone.utc)
+            if end_dt <= now or end_dt > cutoff:
+                continue   # skip already-resolved or >30 days away
+
+            # ── Volume / liquidity flags ───────────────────────────────────────
             vol_24h   = float(m.get("volume24hr") or 0)
             vol_total = float(m.get("volume") or 0)
             liquidity = float(m.get("liquidity") or 0)
@@ -55,6 +69,7 @@ def flag_suspicious_markets(markets: list[dict]) -> list[dict]:
             ):
                 m["_spike_ratio"] = round(spike, 2)
                 m["_is_niche"]    = liquidity < MAX_NICHE_TVL
+                m["_days_to_end"] = round((end_dt - now).total_seconds() / 86400, 1)
                 flagged.append(m)
         except Exception:
             continue
