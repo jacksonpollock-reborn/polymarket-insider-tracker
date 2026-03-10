@@ -6,6 +6,7 @@ import os
 import smtplib
 import logging
 from datetime import datetime, timezone
+from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
 log = logging.getLogger(__name__)
