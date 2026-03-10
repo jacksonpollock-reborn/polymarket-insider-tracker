@@ -33,13 +33,19 @@ WEIGHTS = {
 }
 
 
-def _parse_dt(raw) -> datetime | None:
+def _parse_dt(raw):
     if not raw:
         return None
     try:
-        return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
     except Exception:
-        return None
+        try:
+            return datetime.fromtimestamp(int(raw), tz=timezone.utc)
+        except Exception:
+            return None
 
 
 def score_wallet(
