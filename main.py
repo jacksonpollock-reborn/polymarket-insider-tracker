@@ -15,10 +15,9 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from src.fetchers import (
     fetch_active_markets,
-    fetch_market_trades,
+    fetch_market_top_holders,
     fetch_wallet_activity,
     fetch_wallet_positions,
-    fetch_wallet_pnl,
     fetch_polygon_tx_history,
     fetch_arkham_entity,
     fetch_dune_volume_spikes,
@@ -66,8 +65,9 @@ def group_trades_by_wallet(trades: list[dict]) -> dict[str, list[dict]]:
     wallet_trades = defaultdict(list)
     for t in trades:
         addr = (
-            t.get("maker") or
             t.get("proxyWallet") or
+            t.get("user") or
+            t.get("maker") or
             t.get("transactor") or
             t.get("address") or ""
         ).lower().strip()
@@ -117,23 +117,25 @@ def run():
     else:
         log.warning("  → Dune returned no data (check API key / query IDs)")
 
-    # ── Step 3: Extract large trades from flagged markets ─────────────────────
-    log.info("\n[3/7] Extracting large trades from flagged markets…")
+    # ── Step 3: Extract top holders from flagged markets ──────────────────────
+    log.info("\n[3/7] Extracting top holders from flagged markets…")
     all_trades = []
     for m in flagged_markets:
-        cid = m.get("conditionId") or m.get("condition_id")
-        if not cid:
+        market_id = str(m.get("id") or "")
+        if not market_id:
             continue
-        trades = fetch_market_trades(cid)
-        for t in trades:
-            size = float(t.get("usdcSize") or t.get("size") or 0)
+        holders = fetch_market_top_holders(market_id)
+        for h in holders:
+            size = float(h.get("currentValue") or h.get("size") or h.get("usdcSize") or 0)
             if size >= MIN_BET_USDC:
-                t["_market_name"]      = m.get("question") or m.get("title") or cid
-                t["_market_address"]   = cid
-                t["_market_liquidity"] = float(m.get("liquidity") or 0)
-                t["_market_end"]       = m.get("endDate") or m.get("end_date_iso")
-                t["_spike_ratio"]      = m.get("_spike_ratio", 0)
-                all_trades.append(t)
+                h["_market_name"]      = m.get("question") or m.get("title") or market_id
+                h["_market_address"]   = m.get("conditionId") or market_id
+                h["_market_liquidity"] = float(m.get("liquidity") or 0)
+                h["_market_end"]       = m.get("endDate") or m.get("end_date_iso")
+                h["_spike_ratio"]      = m.get("_spike_ratio", 0)
+                # Normalise size field so scorer can read it
+                h["usdcSize"]          = size
+                all_trades.append(h)
 
     stats["large_trades"] = len(all_trades)
     log.info(f"  → {len(all_trades)} large trades found")
