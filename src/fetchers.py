@@ -103,17 +103,71 @@ def fetch_wallet_positions(address):
     return []
 
 
-# ── Dune — disabled (free tier cannot create queries) ─────────────────────────
+# ── Dune Analytics ────────────────────────────────────────────────────────────
+# Queries pre-created on Dune (free tier can execute existing queries via API)
+DUNE_API        = "https://api.dune.com/api/v1"
+DUNE_KEY        = os.environ.get("DUNE_API_KEY", "")
+DUNE_QUERY_WHALE_WALLETS     = "6807889"
+DUNE_QUERY_NEW_LARGE_BETTORS = "6807896"
 
-def fetch_dune_volume_spikes():
-    log.info("[Dune] Skipped — requires paid plan.")
+
+def _dune_execute_and_fetch(query_id: str) -> list[dict]:
+    """Execute a pre-existing Dune query and return rows."""
+    if not DUNE_KEY:
+        log.warning("[Dune] No API key — skipping")
+        return []
+
+    headers = {"X-Dune-API-Key": DUNE_KEY}
+
+    # Trigger execution
+    exec_resp = SESSION.post(
+        f"{DUNE_API}/query/{query_id}/execute",
+        json={"performance": "medium"},
+        headers=headers,
+        timeout=20,
+    )
+    if exec_resp.status_code != 200:
+        log.warning(f"[Dune] Execute query {query_id} failed: {exec_resp.status_code} {exec_resp.text[:150]}")
+        return []
+
+    execution_id = exec_resp.json().get("execution_id")
+    if not execution_id:
+        return []
+
+    # Poll for completion (max 90s)
+    for _ in range(18):
+        time.sleep(5)
+        result = _get(
+            f"{DUNE_API}/execution/{execution_id}/results",
+            headers=headers,
+        )
+        if not result:
+            continue
+        state = result.get("state", "")
+        if state == "QUERY_STATE_COMPLETED":
+            rows = result.get("result", {}).get("rows", [])
+            log.info(f"[Dune] Query {query_id} returned {len(rows)} rows")
+            return rows
+        if "FAILED" in state or "CANCELLED" in state:
+            log.warning(f"[Dune] Query {query_id} state: {state}")
+            return []
+
+    log.warning(f"[Dune] Query {query_id} timed out")
     return []
 
-def fetch_dune_whale_wallets():
+
+def fetch_dune_volume_spikes() -> list[dict]:
     return []
 
-def fetch_dune_new_large_bettors():
-    return []
+
+def fetch_dune_whale_wallets() -> list[str]:
+    rows = _dune_execute_and_fetch(DUNE_QUERY_WHALE_WALLETS)
+    return [r.get("wallet") for r in rows if r.get("wallet")]
+
+
+def fetch_dune_new_large_bettors() -> list[str]:
+    rows = _dune_execute_and_fetch(DUNE_QUERY_NEW_LARGE_BETTORS)
+    return [r.get("wallet") for r in rows if r.get("wallet")]
 
 
 # ── Polygonscan ────────────────────────────────────────────────────────────────
