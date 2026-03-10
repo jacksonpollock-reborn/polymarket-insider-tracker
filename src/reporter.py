@@ -6,7 +6,6 @@ import os
 import smtplib
 import logging
 from datetime import datetime, timezone
-from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
 log = logging.getLogger(__name__)
@@ -53,24 +52,42 @@ def _format_wallet(w: dict) -> str:
     # Active positions table rows
     pos_rows = ""
     for p in pos:
-        side_color = "#38a169" if p["side"] == "YES" else "#e53e3e"
-        end_str = p.get("market_end") or "?"
-        if end_str and end_str != "?":
+        side    = p.get("side", "BUY").upper()
+        outcome = p.get("outcome", "")
+        # Color: BUY=green, SELL=red
+        side_color = "#38a169" if side == "BUY" else "#e53e3e"
+
+        # Format resolution date + days remaining
+        end_raw  = p.get("market_end") or "?"
+        end_str  = "?"
+        days_str = ""
+        if end_raw and end_raw != "?":
             try:
-                end_str = datetime.fromisoformat(str(end_str).replace("Z","+00:00")).strftime("%b %d %Y")
+                end_dt   = datetime.fromisoformat(str(end_raw).replace("Z", "+00:00"))
+                end_str  = end_dt.strftime("%b %d %Y")
+                days_left = (end_dt - datetime.now(timezone.utc)).days
+                if days_left >= 0:
+                    days_str = f" ({days_left}d)"
             except Exception:
-                pass
+                end_str = str(end_raw)[:10]
+
+        # Side + outcome label: "BUY · Overpass" or just "BUY" for binary
+        if outcome and outcome.upper() not in ("YES", "NO", "BUY", "SELL", ""):
+            position_label = f'{side} <span style="color:#a0aec0;font-weight:400;">· {outcome}</span>'
+        else:
+            outcome_display = outcome if outcome else ""
+            position_label  = f'{side}' + (f' <span style="color:#a0aec0;font-weight:400;">{outcome_display}</span>' if outcome_display else "")
 
         pos_rows += f"""
         <tr>
-          <td style="padding:6px 10px;border-bottom:1px solid #2d3748;max-width:260px;font-size:12px;">{p['market_name'][:60]}{'…' if len(p['market_name'])>60 else ''}</td>
-          <td style="padding:6px 10px;border-bottom:1px solid #2d3748;text-align:center;">
-            <span style="color:{side_color};font-weight:700;">{p['side']}</span>
+          <td style="padding:6px 10px;border-bottom:1px solid #2d3748;max-width:220px;font-size:12px;">{p['market_name'][:55]}{'…' if len(p['market_name'])>55 else ''}</td>
+          <td style="padding:6px 10px;border-bottom:1px solid #2d3748;text-align:center;white-space:nowrap;">
+            <span style="color:{side_color};font-weight:700;">{position_label}</span>
           </td>
           <td style="padding:6px 10px;border-bottom:1px solid #2d3748;text-align:right;">${p['amount_usdc']:,.0f}</td>
           <td style="padding:6px 10px;border-bottom:1px solid #2d3748;text-align:center;">{p['entry_price']:.2f}</td>
           <td style="padding:6px 10px;border-bottom:1px solid #2d3748;text-align:right;">${p['market_liquidity']:,.0f}</td>
-          <td style="padding:6px 10px;border-bottom:1px solid #2d3748;text-align:center;">{end_str}</td>
+          <td style="padding:6px 10px;border-bottom:1px solid #2d3748;text-align:center;white-space:nowrap;">{end_str}<span style="color:#e53e3e;">{days_str}</span></td>
         </tr>"""
 
     pos_table = f"""
@@ -78,7 +95,7 @@ def _format_wallet(w: dict) -> str:
       <thead>
         <tr style="background:#2d3748;">
           <th style="padding:6px 10px;text-align:left;">Market</th>
-          <th style="padding:6px 10px;">Side</th>
+          <th style="padding:6px 10px;">Side · Outcome</th>
           <th style="padding:6px 10px;text-align:right;">Size (USDC)</th>
           <th style="padding:6px 10px;">Entry</th>
           <th style="padding:6px 10px;text-align:right;">Market TVL</th>
