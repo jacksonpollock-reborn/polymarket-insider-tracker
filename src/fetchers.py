@@ -70,10 +70,28 @@ def fetch_active_markets(limit: int = 150) -> list[dict]:
 
 
 def fetch_market_trades(condition_id: str, limit: int = 100) -> list[dict]:
-    """Fetch recent trades for a specific market."""
-    result = _get(f"{DATA_API}/activity", params={"market": condition_id, "limit": limit})
+    """
+    Fetch recent large trades for a market.
+    Tries CLOB trades endpoint first, falls back to fetching top position holders.
+    """
+    # Try CLOB API trades endpoint (uses market conditionId)
+    result = _get(f"{CLOB_API}/trades", params={"market": condition_id, "limit": limit})
     time.sleep(0.1)
-    return result if isinstance(result, list) else []
+    if isinstance(result, list) and result:
+        return result
+    if isinstance(result, dict):
+        trades = result.get("data") or result.get("results") or []
+        if trades:
+            return trades
+
+    # Fallback: fetch top liquidity positions in this market from gamma API
+    positions = _get(f"{GAMMA_API}/positions", params={"conditionId": condition_id, "limit": limit})
+    time.sleep(0.1)
+    if isinstance(positions, list):
+        return positions
+    if isinstance(positions, dict):
+        return positions.get("data", [])
+    return []
 
 
 def fetch_wallet_activity(address: str) -> list[dict]:
@@ -170,68 +188,108 @@ def fetch_polygon_tx_history(address: str, days_back: int = 90) -> dict:
 # DUNE ANALYTICS
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Pre-built Dune queries for Polymarket (community dashboards)
-DUNE_QUERIES = {
-    "volume_spikes":    "3618848",   # Polymarket 24h volume spike by market
-    "whale_wallets":    "3618901",   # Top USDC depositors last 24h
-    "new_wallets":      "3618955",   # New wallets betting > $5k
-}
+# ── Inline SQL queries (no pre-saved query IDs needed) ────────────────────────
+DUNE_SQL_WHALE_WALLETS = """
+SELECT
+    trader_address AS wallet,
+    SUM(usdc_amount) AS total_usdc
+FROM polymarket.trades
+WHERE block_time >= NOW() - INTERVAL '24' HOUR
+  AND usdc_amount >= 5000
+GROUP BY trader_address
+HAVING SUM(usdc_amount) >= 10000
+ORDER BY total_usdc DESC
+LIMIT 50
+"""
 
-def _dune_execute(query_id: str, params: dict = None) -> list[dict] | None:
+DUNE_SQL_NEW_LARGE_BETTORS = """
+SELECT trader_address AS wallet
+FROM polymarket.trades
+WHERE block_time >= NOW() - INTERVAL '24' HOUR
+  AND usdc_amount >= 5000
+  AND trader_address NOT IN (
+      SELECT DISTINCT trader_address
+      FROM polymarket.trades
+      WHERE block_time < NOW() - INTERVAL '30' DAY
+  )
+GROUP BY trader_address
+LIMIT 50
+"""
+
+def _dune_run_sql(sql: str) -> list[dict] | None:
+    """Execute an ad-hoc SQL query via Dune API and return rows."""
     if not DUNE_KEY:
         log.warning("[Dune] No API key — skipping Dune queries")
         return None
 
-    headers = {"X-Dune-API-Key": DUNE_KEY}
+    headers = {"X-Dune-API-Key": DUNE_KEY, "Content-Type": "application/json"}
 
-    # Trigger execution
-    body = {"query_parameters": params or {}}
+    # Create a one-off query
+    create_resp = SESSION.post(
+        f"{DUNE_API}/query",
+        json={"name": "polymarket-insider-tracker-adhoc", "query_sql": sql},
+        headers=headers, timeout=20
+    )
+    if create_resp.status_code not in (200, 201):
+        log.warning(f"[Dune] Failed to create query: {create_resp.status_code} {create_resp.text[:200]}")
+        return None
+
+    query_id = create_resp.json().get("query_id")
+    if not query_id:
+        return None
+
+    # Execute
     exec_resp = SESSION.post(
         f"{DUNE_API}/query/{query_id}/execute",
-        json=body, headers=headers, timeout=20
+        json={}, headers=headers, timeout=20
     )
     if exec_resp.status_code != 200:
-        log.warning(f"[Dune] Failed to execute query {query_id}: {exec_resp.text}")
+        log.warning(f"[Dune] Failed to execute query {query_id}: {exec_resp.text[:200]}")
         return None
 
     execution_id = exec_resp.json().get("execution_id")
     if not execution_id:
         return None
 
-    # Poll for results (max 60s)
-    for _ in range(12):
+    # Poll for results (max 90s)
+    for _ in range(18):
         time.sleep(5)
-        status_resp = _get(
+        result_resp = _get(
             f"{DUNE_API}/execution/{execution_id}/results",
             headers=headers
         )
-        if status_resp and status_resp.get("state") == "QUERY_STATE_COMPLETED":
-            return status_resp.get("result", {}).get("rows", [])
+        if not result_resp:
+            continue
+        state = result_resp.get("state", "")
+        if state == "QUERY_STATE_COMPLETED":
+            return result_resp.get("result", {}).get("rows", [])
+        if "FAILED" in state or "CANCELLED" in state:
+            log.warning(f"[Dune] Query execution {state}")
+            return None
 
-    log.warning(f"[Dune] Query {query_id} timed out")
+    log.warning("[Dune] Query timed out after 90s")
     return None
 
 
 def fetch_dune_volume_spikes() -> list[dict]:
-    """Markets with unusual 24h volume vs. 7d baseline."""
-    rows = _dune_execute(DUNE_QUERIES["volume_spikes"])
-    return rows or []
+    """Placeholder — volume spike detection handled via Polymarket Gamma API directly."""
+    return []
 
 
 def fetch_dune_whale_wallets() -> list[str]:
-    """Wallets that deposited large USDC into Polymarket in last 24h."""
-    rows = _dune_execute(DUNE_QUERIES["whale_wallets"])
+    """Wallets that placed large USDC bets on Polymarket in last 24h."""
+    rows = _dune_run_sql(DUNE_SQL_WHALE_WALLETS)
     if not rows:
         return []
-    return [r.get("wallet") or r.get("address") for r in rows if r.get("wallet") or r.get("address")]
+    return [r.get("wallet") for r in rows if r.get("wallet")]
 
 
 def fetch_dune_new_large_bettors() -> list[str]:
-    """Brand-new wallets making large bets."""
-    rows = _dune_execute(DUNE_QUERIES["new_wallets"])
+    """Brand-new wallets (no history before 30 days ago) making large bets."""
+    rows = _dune_run_sql(DUNE_SQL_NEW_LARGE_BETTORS)
     if not rows:
         return []
-    return [r.get("wallet") or r.get("address") for r in rows if r.get("wallet") or r.get("address")]
+    return [r.get("wallet") for r in rows if r.get("wallet")]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
