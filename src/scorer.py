@@ -102,17 +102,25 @@ def score_wallet(
     else:
         flags["large_bet_niche"] = False
 
-    # ── 3. Zero-hedge: pure YES or pure NO across all current trades ───────────
+    # ── 3. Zero-hedge: pure BUY or pure SELL across real trades (excl. redemptions)
+    # Redemptions = SELL at price ~1.00 after market resolves — not real trading behaviour
+    real_trades = [
+        t for t in recent_trades
+        if not (
+            (t.get("side") or "").upper() in ("SELL", "NO")
+            and float(t.get("price") or 0) >= 0.99
+        )
+    ]
     sides = set()
-    for t in recent_trades:
-        s = (t.get("side") or t.get("outcome") or "").upper()
-        if s in ("YES", "BUY"):
-            sides.add("YES")
-        elif s in ("NO", "SELL"):
-            sides.add("NO")
+    for t in real_trades:
+        s = (t.get("side") or "").upper()
+        if s in ("BUY",):
+            sides.add("BUY")
+        elif s in ("SELL",):
+            sides.add("SELL")
 
     flags["sides_traded"] = list(sides)
-    if len(sides) == 1 and len(recent_trades) >= 2:
+    if len(sides) == 1 and len(real_trades) >= 2:
         score += WEIGHTS["zero_hedge"]
         flags["zero_hedge"] = True
     else:
@@ -223,10 +231,14 @@ def score_wallet(
     if flags["dune_new_wallet_flag"]:
         score += WEIGHTS["dune_new_wallet_flag"]
 
-    # ── Build active positions summary ────────────────────────────────────────
+    # ── Build active positions summary (exclude redemptions) ─────────────────
     active_positions = []
     for t in recent_trades:
-        side    = (t.get("side") or "BUY").upper()         # BUY or SELL
+        price_val = float(t.get("price") or 0)
+        side      = (t.get("side") or "BUY").upper()
+        # Skip redemptions — resolved market payouts at price ~1.00
+        if side in ("SELL", "NO") and price_val >= 0.99:
+            continue
         outcome = t.get("outcome") or t.get("name") or ""  # e.g. "Overpass", "Yes", "No"
         active_positions.append({
             "market_name":      t.get("_market_name", "Unknown"),
