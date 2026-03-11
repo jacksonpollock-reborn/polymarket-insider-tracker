@@ -71,14 +71,29 @@ def fetch_market_trades(condition_id, limit=100):
     Returns list of trade dicts with keys:
       proxyWallet, side, size, price, outcome, timestamp, title, conditionId
     Note: size is share quantity. USDC value = size * price.
+
+    Redemption filter: when a market resolves, winners redeem shares at price=1.00.
+    These show up as SELL at price 1.00 in the API but are NOT real sell trades —
+    they are just prize collection. We filter them out to avoid false signals.
     """
     result = _get(f"{DATA_API}/trades", params={"market": condition_id, "limit": limit})
     time.sleep(0.15)
-    if isinstance(result, list):
-        return result
+
     if isinstance(result, dict):
-        return result.get("data") or result.get("results") or []
-    return []
+        result = result.get("data") or result.get("results") or []
+    if not isinstance(result, list):
+        return []
+
+    # Filter out redemptions: price >= 0.99 on a SELL = resolved market payout
+    filtered = []
+    for t in result:
+        price = float(t.get("price") or 0)
+        side  = (t.get("side") or "").upper()
+        if side in ("SELL", "NO") and price >= 0.99:
+            continue   # skip redemption
+        filtered.append(t)
+
+    return filtered
 
 
 # ── Wallet data ────────────────────────────────────────────────────────────────
