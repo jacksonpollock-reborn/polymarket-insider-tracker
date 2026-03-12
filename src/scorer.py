@@ -30,7 +30,19 @@ WEIGHTS = {
     "coordinated_cluster":   15,
     "dune_whale_flag":       10,
     "dune_new_wallet_flag":  10,
+    # Anti-evasion signals
+    "cumulative_position":   20,   # smurfing: many small bets add up
+    "decoy_hedge":           15,   # fake hedge: tiny opposite bet to fool scanner
+    "coordinated_swarm":     25,   # multiple new wallets same market same time
+    "quick_flip":            15,   # buy then sell within 24h (swing, not conviction)
 }
+
+# Anti-evasion thresholds
+CUMULATIVE_POSITION_MIN  = 10_000   # total across all bets in same market
+DECOY_HEDGE_RATIO        = 0.10     # minority side < 10% of majority = fake hedge
+COORDINATED_SWARM_HOURS  = 2        # wallets acting within ±2h = coordinated
+COORDINATED_SWARM_MIN    = 3        # min wallets to flag as swarm
+QUICK_FLIP_HOURS         = 24       # buy→sell within 24h = swing trade
 
 
 def _parse_dt(raw):
@@ -57,6 +69,7 @@ def score_wallet(
     arkham_data: dict,
     dune_whale_list: list[str],
     dune_new_wallet_list: list[str],
+    is_swarm_wallet: bool = False,    # flagged by cross-wallet swarm detection
 ) -> dict:
     """Returns a scored wallet record ready for the watchlist."""
 
@@ -102,8 +115,27 @@ def score_wallet(
     else:
         flags["large_bet_niche"] = False
 
-    # ── 3. Zero-hedge: pure BUY or pure SELL across real trades (excl. redemptions)
-    # Redemptions = SELL at price ~1.00 after market resolves — not real trading behaviour
+    # ── 2b. Cumulative position (smurfing detection) ───────────────────────────
+    # Sum all BUY trades per market — many small bets in same market = smurfing
+    market_totals: dict[str, float] = {}
+    for t in recent_trades:
+        if (t.get("side") or "").upper() != "BUY":
+            continue
+        mkt = t.get("_market_address") or t.get("_market_name") or "unknown"
+        market_totals[mkt] = market_totals.get(mkt, 0) + float(t.get("usdcSize") or 0)
+
+    smurf_markets = {m: v for m, v in market_totals.items() if v >= CUMULATIVE_POSITION_MIN}
+    flags["smurf_markets"]       = list(smurf_markets.keys())
+    flags["cumulative_max_usdc"] = round(max(market_totals.values()), 2) if market_totals else 0
+
+    if smurf_markets:
+        score += WEIGHTS["cumulative_position"]
+        flags["cumulative_position"] = True
+    else:
+        flags["cumulative_position"] = False
+
+    # ── 3. Zero-hedge + Decoy-hedge detection ────────────────────────────────
+    # Redemptions = SELL at price ~1.00 after market resolves — not real trading
     real_trades = [
         t for t in recent_trades
         if not (
@@ -111,20 +143,42 @@ def score_wallet(
             and float(t.get("price") or 0) >= 0.99
         )
     ]
+
+    buy_usdc  = sum(float(t.get("usdcSize") or 0) for t in real_trades if (t.get("side") or "").upper() == "BUY")
+    sell_usdc = sum(float(t.get("usdcSize") or 0) for t in real_trades if (t.get("side") or "").upper() == "SELL")
+    total_usdc = buy_usdc + sell_usdc
+
     sides = set()
-    for t in real_trades:
-        s = (t.get("side") or "").upper()
-        if s in ("BUY",):
-            sides.add("BUY")
-        elif s in ("SELL",):
-            sides.add("SELL")
+    if buy_usdc  > 0: sides.add("BUY")
+    if sell_usdc > 0: sides.add("SELL")
 
     flags["sides_traded"] = list(sides)
+    flags["buy_usdc"]     = round(buy_usdc, 2)
+    flags["sell_usdc"]    = round(sell_usdc, 2)
+
+    # True zero-hedge: only one side
     if len(sides) == 1 and len(real_trades) >= 2:
         score += WEIGHTS["zero_hedge"]
-        flags["zero_hedge"] = True
+        flags["zero_hedge"]   = True
+        flags["decoy_hedge"]  = False
+    elif len(sides) == 2 and total_usdc > 0:
+        # Decoy-hedge: both sides exist but minority is < DECOY_HEDGE_RATIO of majority
+        minority = min(buy_usdc, sell_usdc)
+        majority = max(buy_usdc, sell_usdc)
+        hedge_ratio = minority / majority if majority > 0 else 0
+        flags["hedge_ratio"] = round(hedge_ratio, 3)
+        if hedge_ratio < DECOY_HEDGE_RATIO:
+            # Tiny opposite bet — treating as effectively zero-hedge
+            score += WEIGHTS["zero_hedge"]
+            score += WEIGHTS["decoy_hedge"]
+            flags["zero_hedge"]  = True   # functionally unhedged
+            flags["decoy_hedge"] = True   # but tried to fake it
+        else:
+            flags["zero_hedge"]  = False
+            flags["decoy_hedge"] = False
     else:
-        flags["zero_hedge"] = False
+        flags["zero_hedge"]  = False
+        flags["decoy_hedge"] = False
 
     # ── 4. Immaculate timing: bet within TIMING_HOURS of resolution ────────────
     timing_hits = []
@@ -231,6 +285,47 @@ def score_wallet(
     if flags["dune_new_wallet_flag"]:
         score += WEIGHTS["dune_new_wallet_flag"]
 
+    # ── 8b. Coordinated swarm (cross-wallet, detected in main.py) ─────────────
+    flags["coordinated_swarm"] = is_swarm_wallet
+    if is_swarm_wallet:
+        score += WEIGHTS["coordinated_swarm"]
+
+    # ── 9. Quick-flip detection (swing trade, not conviction) ────────────────
+    # Look in full wallet activity for BUY→SELL in same market within QUICK_FLIP_HOURS
+    flip_events = []
+    activity_by_market: dict[str, list] = {}
+    for a in polymarket_activity:
+        mkt = a.get("conditionId") or a.get("market") or ""
+        if mkt:
+            activity_by_market.setdefault(mkt, []).append(a)
+
+    for mkt, acts in activity_by_market.items():
+        buys  = [a for a in acts if (a.get("side") or a.get("type") or "").upper() in ("BUY",)]
+        sells = [a for a in acts if (a.get("side") or a.get("type") or "").upper() in ("SELL",)
+                 and float(a.get("price") or 0) < 0.99]   # exclude redemptions
+        for b in buys:
+            b_dt = _parse_dt(b.get("timestamp") or b.get("createdAt"))
+            if not b_dt:
+                continue
+            for s in sells:
+                s_dt = _parse_dt(s.get("timestamp") or s.get("createdAt"))
+                if not s_dt:
+                    continue
+                hours_held = (s_dt - b_dt).total_seconds() / 3600
+                if 0 < hours_held < QUICK_FLIP_HOURS:
+                    flip_events.append({
+                        "market":      mkt,
+                        "hours_held":  round(hours_held, 1),
+                        "buy_usdc":    float(b.get("usdcSize") or b.get("size") or 0),
+                    })
+
+    flags["quick_flips"] = flip_events
+    if flip_events:
+        score += WEIGHTS["quick_flip"]
+        flags["quick_flip"] = True
+    else:
+        flags["quick_flip"] = False
+
     # ── Build active positions summary (exclude redemptions) ─────────────────
     active_positions = []
     for t in recent_trades:
@@ -263,6 +358,14 @@ def score_wallet(
         alert_triggers.append("ALERT_TIMING_SNIPE")
     if flags.get("mixer_flag"):
         alert_triggers.append("ALERT_SUSPICIOUS_FUNDING")
+    if flags.get("cumulative_position"):
+        alert_triggers.append("ALERT_SMURF_DETECTED")
+    if flags.get("decoy_hedge"):
+        alert_triggers.append("ALERT_FAKE_HEDGE")
+    if flags.get("coordinated_swarm"):
+        alert_triggers.append("ALERT_COORDINATED_SWARM")
+    if flags.get("quick_flip"):
+        alert_triggers.append("ALERT_QUICK_FLIP")
 
     return {
         "wallet_address":   address,
