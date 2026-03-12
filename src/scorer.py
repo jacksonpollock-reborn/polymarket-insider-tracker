@@ -135,13 +135,11 @@ def score_wallet(
         flags["cumulative_position"] = False
 
     # ── 3. Zero-hedge + Decoy-hedge detection ────────────────────────────────
-    # Redemptions = SELL at price ~1.00 after market resolves — not real trading
+    # Redemptions = any trade at price ~1.00 — not real trading behaviour
+    # Real trades never occur at price >= 0.99 (max payout is $1.00 per share)
     real_trades = [
         t for t in recent_trades
-        if not (
-            (t.get("side") or "").upper() in ("SELL", "NO")
-            and float(t.get("price") or 0) >= 0.99
-        )
+        if float(t.get("price") or 0) < 0.99
     ]
 
     buy_usdc  = sum(float(t.get("usdcSize") or 0) for t in real_trades if (t.get("side") or "").upper() == "BUY")
@@ -331,8 +329,8 @@ def score_wallet(
     for t in recent_trades:
         price_val = float(t.get("price") or 0)
         side      = (t.get("side") or "BUY").upper()
-        # Skip redemptions — resolved market payouts at price ~1.00
-        if side in ("SELL", "NO") and price_val >= 0.99:
+        # Skip all redemptions — price >= 0.99 means resolved market payout (both BUY and SELL)
+        if price_val >= 0.99:
             continue
         outcome = t.get("outcome") or t.get("name") or ""  # e.g. "Overpass", "Yes", "No"
         active_positions.append({
