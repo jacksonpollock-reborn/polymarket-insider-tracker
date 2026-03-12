@@ -156,6 +156,43 @@ def run():
     stats["large_trades"] = len(all_trades)
     log.info(f"  → {len(all_trades)} large trades found")
 
+    # ── Step 3b: Coordinated swarm detection ─────────────────────────
+    # Multiple new wallets entering same market within ±2h = coordinated swarm
+    SWARM_HOURS = 2
+    SWARM_MIN   = 3
+    from collections import defaultdict as _dd
+    market_wallet_times = _dd(list)
+    for t in all_trades:
+        mkt  = t.get("_market_address", "")
+        addr = (t.get("proxyWallet") or t.get("maker") or "").lower()
+        ts   = t.get("timestamp") or t.get("createdAt")
+        if mkt and addr and ts:
+            try:
+                dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                market_wallet_times[mkt].append((addr, dt))
+            except Exception:
+                pass
+
+    swarm_wallets = set()
+    for mkt, entries in market_wallet_times.items():
+        entries.sort(key=lambda x: x[1])
+        for i, (addr_i, dt_i) in enumerate(entries):
+            cluster = [addr_i]
+            for addr_j, dt_j in entries[i+1:]:
+                if (dt_j - dt_i).total_seconds() / 3600 <= SWARM_HOURS:
+                    if addr_j != addr_i:
+                        cluster.append(addr_j)
+                else:
+                    break
+            if len(set(cluster)) >= SWARM_MIN:
+                for w in cluster:
+                    swarm_wallets.add(w)
+
+    if swarm_wallets:
+        log.info(f"  → Coordinated swarm: {len(swarm_wallets)} wallets flagged")
+
     # ── Step 4: Group by wallet + merge Dune seed wallets ─────────────────────
     log.info("\n[4/7] Grouping trades by wallet…")
     wallet_trades = group_trades_by_wallet(all_trades)
@@ -203,6 +240,7 @@ def run():
             arkham_data          = arkham,
             dune_whale_list      = dune_whale_list,
             dune_new_wallet_list = dune_new_wallet_list,
+            is_swarm_wallet      = addr in swarm_wallets,
         )
 
         if record["suspicion_score"] >= MIN_SUSPICION_SCORE:
