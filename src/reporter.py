@@ -55,7 +55,6 @@ def _format_wallet(w: dict) -> str:
     for p in pos:
         side    = p.get("side", "BUY").upper()
         outcome = p.get("outcome", "")
-        # Color: BUY=green, SELL=red
         side_color = "#38a169" if side == "BUY" else "#e53e3e"
 
         # Format resolution date + days remaining
@@ -72,19 +71,41 @@ def _format_wallet(w: dict) -> str:
             except Exception:
                 end_str = str(end_raw)[:10]
 
-        # Side + outcome label: "BUY · Overpass" or just "BUY" for binary
-        if outcome and outcome.upper() not in ("YES", "NO", "BUY", "SELL", ""):
-            position_label = f'{side} <span style="color:#a0aec0;font-weight:400;">· {outcome}</span>'
+        # ── Market name: show FULL name, never truncate the end
+        # The key info (date, specific condition) is usually at the END of the question
+        market_name = p["market_name"]
+        # Split into two lines if long: first 60 chars + rest on second line
+        if len(market_name) > 65:
+            split_idx   = market_name.rfind(" ", 0, 65)
+            split_idx   = split_idx if split_idx > 30 else 65
+            name_line1  = market_name[:split_idx]
+            name_line2  = f'<br><span style="color:#a0aec0;">{market_name[split_idx:].strip()}</span>'
         else:
-            outcome_display = outcome if outcome else ""
-            position_label  = f'{side}' + (f' <span style="color:#a0aec0;font-weight:400;">{outcome_display}</span>' if outcome_display else "")
+            name_line1 = market_name
+            name_line2 = ""
+
+        # ── Side + outcome: always show YES/NO prominently
+        # For binary markets: "BUY YES" / "BUY NO"
+        # For multi-outcome: "BUY · Overpass"
+        outcome_upper = outcome.upper()
+        if outcome_upper in ("YES", "NO"):
+            outcome_color  = "#38a169" if outcome_upper == "YES" else "#e53e3e"
+            position_label = (
+                f'<span style="color:{side_color};font-weight:700;">{side}</span> ' +
+                f'<span style="color:{outcome_color};font-weight:700;font-size:13px;">{outcome_upper}</span>'
+            )
+        elif outcome and outcome_upper not in ("BUY", "SELL", ""):
+            position_label = (
+                f'<span style="color:{side_color};font-weight:700;">{side}</span> ' +
+                f'<span style="color:#e2e8f0;">· {outcome}</span>'
+            )
+        else:
+            position_label = f'<span style="color:{side_color};font-weight:700;">{side}</span>'
 
         pos_rows += f"""
         <tr>
-          <td style="padding:6px 10px;border-bottom:1px solid #2d3748;max-width:220px;font-size:12px;">{p['market_name'][:55]}{'…' if len(p['market_name'])>55 else ''}</td>
-          <td style="padding:6px 10px;border-bottom:1px solid #2d3748;text-align:center;white-space:nowrap;">
-            <span style="color:{side_color};font-weight:700;">{position_label}</span>
-          </td>
+          <td style="padding:6px 10px;border-bottom:1px solid #2d3748;max-width:260px;font-size:12px;line-height:1.4;">{name_line1}{name_line2}</td>
+          <td style="padding:6px 10px;border-bottom:1px solid #2d3748;text-align:center;white-space:nowrap;">{position_label}</td>
           <td style="padding:6px 10px;border-bottom:1px solid #2d3748;text-align:right;">${p['amount_usdc']:,.0f}</td>
           <td style="padding:6px 10px;border-bottom:1px solid #2d3748;text-align:center;">{p['entry_price']:.2f}</td>
           <td style="padding:6px 10px;border-bottom:1px solid #2d3748;text-align:right;">${p['market_liquidity']:,.0f}</td>
