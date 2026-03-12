@@ -84,13 +84,16 @@ def fetch_market_trades(condition_id, limit=100):
     if not isinstance(result, list):
         return []
 
-    # Filter out redemptions: price >= 0.99 on a SELL = resolved market payout
+    # Filter out redemptions: price >= 0.99 = resolved market payout
+    # This applies to BOTH sides:
+    #   SELL at 1.00 = winning side collecting payout
+    #   BUY  at 1.00 = also seen in some redemption flows
+    # Real trades never happen at price >= 0.99 (no rational buyer pays $1 for a $1 max payout)
     filtered = []
     for t in result:
         price = float(t.get("price") or 0)
-        side  = (t.get("side") or "").upper()
-        if side in ("SELL", "NO") and price >= 0.99:
-            continue   # skip redemption
+        if price >= 0.99:
+            continue   # skip all redemptions regardless of side
         filtered.append(t)
 
     return filtered
