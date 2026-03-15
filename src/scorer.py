@@ -332,12 +332,14 @@ def score_wallet(
         # Skip all redemptions — price >= 0.99 means resolved market payout (both BUY and SELL)
         if price_val >= 0.99:
             continue
-        outcome = t.get("outcome") or t.get("name") or ""  # e.g. "Overpass", "Yes", "No"
+        outcome  = t.get("outcome") or t.get("name") or ""  # e.g. "Overpass", "Yes", "No"
+        category = t.get("_market_category", "Other")
         active_positions.append({
             "market_name":      t.get("_market_name", "Unknown"),
             "market_address":   t.get("_market_address", ""),
             "side":             side,
             "outcome":          outcome,   # ← specific position purchased
+            "category":         category,  # ← Sports / Politics / Crypto / Finance / Other
             "amount_usdc":      float(t.get("usdcSize") or t.get("size") or 0),
             "entry_price":      float(t.get("price") or 0),
             "market_liquidity": float(t.get("_market_liquidity") or 0),
@@ -364,6 +366,9 @@ def score_wallet(
         alert_triggers.append("ALERT_COORDINATED_SWARM")
     if flags.get("quick_flip"):
         alert_triggers.append("ALERT_QUICK_FLIP")
+    # Sports market warning — insider info not possible in sports
+    if any(p.get("category") == "Sports" for p in active_positions):
+        alert_triggers.append("CAUTION_SPORTS_MARKET")
 
     return {
         "wallet_address":   address,
