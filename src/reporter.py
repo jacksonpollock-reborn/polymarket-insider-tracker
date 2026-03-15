@@ -71,6 +71,28 @@ def _format_wallet(w: dict) -> str:
             except Exception:
                 end_str = str(end_raw)[:10]
 
+        # ── Category badge + sports warning
+        category = p.get("category", "Other")
+        cat_colors = {
+            "Sports":   ("#744210", "#f6ad55"),   # orange bg, orange text
+            "Politics": ("#1a365d", "#63b3ed"),   # blue
+            "Crypto":   ("#1c4532", "#68d391"),   # green
+            "Finance":  ("#322659", "#b794f4"),   # purple
+            "Other":    ("#1a202c", "#a0aec0"),   # grey
+        }
+        cat_bg, cat_fg = cat_colors.get(category, cat_colors["Other"])
+        cat_badge = (
+            f'<span style="background:{cat_bg};color:{cat_fg};font-size:10px;'
+            f'font-weight:700;padding:1px 5px;border-radius:3px;margin-right:4px;'
+            f'vertical-align:middle;">{category}</span>'
+        )
+        sports_warning = ""
+        if category == "Sports":
+            sports_warning = (
+                '<br><span style="color:#e53e3e;font-size:10px;font-weight:600;">'
+                '⚠️ 體育市場 — 可能不是 Insider，請自行判斷</span>'
+            )
+
         # ── Market name: show FULL name, never truncate the end
         # The key info (date, specific condition) is usually at the END of the question
         market_name = p["market_name"]
@@ -104,7 +126,7 @@ def _format_wallet(w: dict) -> str:
 
         pos_rows += f"""
         <tr>
-          <td style="padding:6px 10px;border-bottom:1px solid #2d3748;max-width:260px;font-size:12px;line-height:1.4;">{name_line1}{name_line2}</td>
+          <td style="padding:6px 10px;border-bottom:1px solid #2d3748;max-width:260px;font-size:12px;line-height:1.4;">{cat_badge}{name_line1}{name_line2}{sports_warning}</td>
           <td style="padding:6px 10px;border-bottom:1px solid #2d3748;text-align:center;white-space:nowrap;">{position_label}</td>
           <td style="padding:6px 10px;border-bottom:1px solid #2d3748;text-align:right;">${p['amount_usdc']:,.0f}</td>
           <td style="padding:6px 10px;border-bottom:1px solid #2d3748;text-align:center;">{p['entry_price']:.2f}</td>
