@@ -90,6 +90,52 @@ def group_trades_by_wallet(trades: list[dict]) -> dict[str, list[dict]]:
     return wallet_trades
 
 
+# ── Market category detection ─────────────────────────────────────────────────
+SPORTS_KEYWORDS = {
+    "nba", "nfl", "nhl", "mlb", "ncaa", "nfl", "soccer", "tennis",
+    "football", "basketball", "baseball", "hockey", "golf", "ufc", "mma",
+    "esports", "match", "game", "vs.", "vs ", "spread", "o/u", "over/under",
+    "nuggets", "lakers", "celtics", "warriors", "bulls", "heat", "nets",
+    "champions league", "premier league", "bundesliga", "serie a", "la liga",
+    "world cup", "super bowl", "playoffs", "tournament", "race",
+}
+
+CRYPTO_KEYWORDS = {"bitcoin", "btc", "eth", "ethereum", "crypto", "token", "sol", "price"}
+POLITICS_KEYWORDS = {"election", "president", "senate", "congress", "vote", "trump",
+                     "biden", "resign", "impeach", "policy", "war", "military", "iran",
+                     "israel", "ukraine", "russia", "china", "fed", "interest rate"}
+
+
+def _detect_market_category(market: dict) -> str:
+    """Classify market into category for display and risk warnings."""
+    tags = [t.lower() for t in (market.get("tags") or [])]
+    question = (market.get("question") or market.get("title") or "").lower()
+    text = question + " " + " ".join(tags)
+
+    # Tags-first: Gamma API includes explicit category tags
+    for tag in tags:
+        if tag in ("sports", "nba", "nfl", "nhl", "mlb", "ncaa", "soccer",
+                   "tennis", "esports", "basketball", "football", "baseball",
+                   "hockey", "golf", "ufc"):
+            return "Sports"
+        if tag in ("crypto", "bitcoin", "ethereum", "defi"):
+            return "Crypto"
+        if tag in ("politics", "elections", "us-politics", "geopolitics"):
+            return "Politics"
+        if tag in ("finance", "economics", "fed", "rates"):
+            return "Finance"
+
+    # Fallback: keyword scan on question text
+    if any(kw in text for kw in SPORTS_KEYWORDS):
+        return "Sports"
+    if any(kw in text for kw in CRYPTO_KEYWORDS):
+        return "Crypto"
+    if any(kw in text for kw in POLITICS_KEYWORDS):
+        return "Politics"
+
+    return "Other"
+
+
 def run():
     log.info("═══════════════════════════════════════════════════════")
     log.info("  Polymarket Insider Tracker — starting daily scan")
@@ -150,6 +196,7 @@ def run():
                 t["_market_liquidity"] = float(m.get("liquidity") or 0)
                 t["_market_end"]       = m.get("endDateIso") or m.get("endDate")
                 t["_spike_ratio"]      = m.get("_spike_ratio", 0)
+                t["_market_category"]  = _detect_market_category(m)
                 t["usdcSize"]          = usdc
                 all_trades.append(t)
 
