@@ -153,13 +153,17 @@ def _format_wallet(w: dict) -> str:
     flag_items = [
         ("New Wallet (<30d)",       flags.get("new_wallet")),
         ("Large Niche Bet",         flags.get("large_bet_niche")),
+        ("Capital Impact ≥10% TVL", flags.get("capital_impact")),
         ("Zero Hedging",            flags.get("zero_hedge")),
+        ("Fake Hedge",              flags.get("decoy_hedge")),
         ("Timing Sniper",           flags.get("immaculate_timing")),
         ("Longshot Win Rate",       flags.get("longshot_flag")),
         ("Bridge Funding",          flags.get("bridge_flag")),
         ("Mixer Funding",           flags.get("mixer_flag")),
+        ("Mixer Urgency <1hr",      flags.get("mixer_urgency")),
         ("Arkham Project Link",     flags.get("arkham_project_link")),
         ("Coordinated Cluster",     flags.get("coordinated_cluster")),
+        ("Coordinated Swarm",       flags.get("coordinated_swarm")),
         ("Dune Whale",              flags.get("dune_whale_flag")),
         ("Dune New Wallet",         flags.get("dune_new_wallet_flag")),
     ]
@@ -186,6 +190,28 @@ def _format_wallet(w: dict) -> str:
     funding_html = ""
     for f in funding:
         funding_html += f'<div style="margin:3px 0;padding:4px 8px;background:#742a2a;border-left:3px solid #e53e3e;border-radius:2px;font-size:11px;">{f}</div>'
+
+    # Tier banner
+    tier       = w.get("tier")
+    tier_sizing = w.get("tier_sizing", "—")
+    tier_exit   = w.get("tier_exit", "—")
+    cat_adj     = w.get("category_adjustment", 0)
+    dom_cat     = w.get("dominant_category", "")
+
+    tier_colors = {"Tier 3": "#e53e3e", "Tier 2": "#dd6b20", "Tier 1": "#d69e2e"}
+    tier_color  = tier_colors.get(tier, "#4a5568")
+
+    if tier:
+        tier_banner = f'''
+    <div style="background:#1a202c;border:1px solid {tier_color};border-radius:6px;padding:10px 14px;margin-bottom:12px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
+        <span style="color:{tier_color};font-weight:800;font-size:14px;">📊 {tier} — Allocate {tier_sizing} of portfolio</span>
+        <span style="color:#a0aec0;font-size:11px;">💰 Take Profit: {tier_exit}</span>
+      </div>
+      {f'<div style="margin-top:6px;font-size:11px;color:#a0aec0;">Category: <b>{dom_cat}</b> — Score adjusted by {cat_adj:+d} pts</div>' if cat_adj != 0 else ""}
+    </div>'''
+    else:
+        tier_banner = ""
 
     return f"""
     <div style="background:#1a202c;border:1px solid {color};border-radius:8px;margin-bottom:24px;overflow:hidden;">
@@ -229,6 +255,9 @@ def _format_wallet(w: dict) -> str:
           </div>
         </div>
 
+        <!-- Tier banner + position sizing -->
+        {tier_banner}
+
         <!-- Alert triggers -->
         {f'<div style="margin-bottom:10px;">{alert_html}</div>' if alerts else ''}
 
@@ -246,11 +275,53 @@ def _format_wallet(w: dict) -> str:
     </div>"""
 
 
-def build_html_report(watchlist: list[dict], run_date: str, stats: dict) -> str:
+def build_html_report(watchlist: list[dict], run_date: str, stats: dict, contrarian_alerts: list = None) -> str:
+    contrarian_alerts = contrarian_alerts or []
     if not watchlist:
         body = '<p style="color:#a0aec0;text-align:center;padding:40px;">No wallets exceeded the suspicion threshold today.</p>'
     else:
         body = "".join(_format_wallet(w) for w in sorted(watchlist, key=lambda x: -x["suspicion_score"]))
+
+    # Build contrarian section
+    if contrarian_alerts:
+        c_rows = ""
+        for c in contrarian_alerts:
+            spike_color = "#e53e3e" if c["direction"] == "UP" else "#38a169"
+            c_rows += f"""
+            <tr>
+              <td style="padding:6px 10px;border-bottom:1px solid #2d3748;font-size:12px;">{c["market"][:60]}</td>
+              <td style="padding:6px 10px;border-bottom:1px solid #2d3748;text-align:center;">
+                <span style="color:{spike_color};font-weight:700;">{c["direction"]} {c["spike_pct"]}%</span>
+              </td>
+              <td style="padding:6px 10px;border-bottom:1px solid #2d3748;text-align:center;">{c["price_from"]} → {c["price_to"]}</td>
+              <td style="padding:6px 10px;border-bottom:1px solid #2d3748;text-align:center;">{c["window_mins"]:.0f} min</td>
+              <td style="padding:6px 10px;border-bottom:1px solid #2d3748;text-align:center;">
+                <span style="color:#68d391;font-weight:700;">{c["opportunity"]}</span>
+              </td>
+            </tr>"""
+        contrarian_section = f"""
+    <div style="background:#1a202c;border:1px solid #276749;border-radius:8px;margin-bottom:24px;overflow:hidden;">
+      <div style="background:#276749;padding:10px 16px;">
+        <span style="font-weight:700;font-size:14px;color:#fff;">⚡ Contrarian Opportunities — Possible Dumb Money Detected</span>
+        <span style="font-size:11px;color:#c6f6d5;margin-left:8px;">Price spiked &gt;30% in &lt;1hr with no news — consider opposite side</span>
+      </div>
+      <div style="padding:12px;">
+        <table style="width:100%;border-collapse:collapse;font-size:12px;color:#e2e8f0;">
+          <thead>
+            <tr style="background:#2d3748;">
+              <th style="padding:6px 10px;text-align:left;">Market</th>
+              <th style="padding:6px 10px;">Spike</th>
+              <th style="padding:6px 10px;">Price Move</th>
+              <th style="padding:6px 10px;">Window</th>
+              <th style="padding:6px 10px;">Opportunity</th>
+            </tr>
+          </thead>
+          <tbody>{c_rows}</tbody>
+        </table>
+      </div>
+    </div>"""
+    else:
+        contrarian_section = ""
 
     return f"""<!DOCTYPE html>
 <html>
@@ -293,6 +364,9 @@ def build_html_report(watchlist: list[dict], run_date: str, stats: dict) -> str:
       <span style="color:#d69e2e;margin-right:12px;">■ 40–49 Watch</span>
     </div>
 
+    <!-- Contrarian opportunities -->
+    {contrarian_section}
+
     <!-- Watchlist -->
     {body}
 
@@ -307,16 +381,18 @@ def build_html_report(watchlist: list[dict], run_date: str, stats: dict) -> str:
 </html>"""
 
 
-def send_email(watchlist: list[dict], stats: dict) -> bool:
+def send_email(watchlist: list[dict], stats: dict, contrarian_alerts: list = None) -> bool:
     if not GMAIL_USER or not GMAIL_PASSWORD:
         log.error("Gmail credentials not configured. Set GMAIL_USER and GMAIL_APP_PASSWORD.")
         return False
 
+    contrarian_alerts = contrarian_alerts or []
     run_date = datetime.now(timezone.utc).strftime("%A, %B %d %Y · %H:%M UTC")
     n        = stats.get("flagged_wallets", 0)
-    subject  = f"🔍 Polymarket Watchlist — {n} wallet{'s' if n!=1 else ''} flagged · {datetime.now(timezone.utc).strftime('%b %d')}"
+    c        = len(contrarian_alerts)
+    subject  = f"🔍 Polymarket Watchlist — {n} wallet{'s' if n!=1 else ''} flagged · {c} contrarian opp · {datetime.now(timezone.utc).strftime('%b %d')}"
 
-    html_body = build_html_report(watchlist, run_date, stats)
+    html_body = build_html_report(watchlist, run_date, stats, contrarian_alerts=contrarian_alerts)
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
