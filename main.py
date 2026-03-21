@@ -153,7 +153,7 @@ def run():
 
     # ── Step 1: Fetch markets ──────────────────────────────────────────────────
     log.info("\n[1/7] Fetching active Polymarket markets…")
-    markets = fetch_active_markets(limit=150)
+    markets = fetch_active_markets(limit=200)
     stats["markets_scanned"] = len(markets)
 
     flagged_markets = flag_suspicious_markets(markets)
