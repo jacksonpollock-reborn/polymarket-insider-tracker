@@ -161,7 +161,7 @@ def run():
 
     if not flagged_markets:
         log.warning("No suspicious markets today. Sending empty report.")
-        send_email([], stats)
+        send_email([], stats, contrarian_alerts=[])
         return
 
     stats["data_sources_active"] += 1  # Polymarket is up
@@ -202,6 +202,58 @@ def run():
 
     stats["large_trades"] = len(all_trades)
     log.info(f"  → {len(all_trades)} large trades found")
+
+    # ── Step 3c: Contrarian opportunity detection (Module C) ──────────────────
+    # Detect "dumb money" price manipulation: price spiked >30% in <1hr with no
+    # fundamental news → the opposite side becomes high +EV
+    contrarian_alerts = []
+    market_price_windows: dict = {}
+    for t in all_trades:
+        mkt   = t.get("_market_address", "")
+        price = float(t.get("price") or 0)
+        ts    = t.get("timestamp") or t.get("createdAt")
+        if not (mkt and price and ts):
+            continue
+        dt = None
+        try:
+            dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+        market_price_windows.setdefault(mkt, []).append((dt, price))
+
+    for mkt, entries in market_price_windows.items():
+        if len(entries) < 2:
+            continue
+        entries.sort(key=lambda x: x[0])
+        # Scan 1-hour rolling windows for >30% price spike
+        for i, (dt_start, p_start) in enumerate(entries):
+            for dt_end, p_end in entries[i+1:]:
+                window_hrs = (dt_end - dt_start).total_seconds() / 3600
+                if window_hrs > 1.0:
+                    break
+                if p_start > 0 and abs(p_end - p_start) / p_start >= 0.30:
+                    direction  = "UP" if p_end > p_start else "DOWN"
+                    opp_side   = "BUY NO" if direction == "UP" else "BUY YES"
+                    mkt_name   = next(
+                        (t.get("_market_name") for t in all_trades if t.get("_market_address") == mkt),
+                        mkt[:20]
+                    )
+                    contrarian_alerts.append({
+                        "market":       mkt_name,
+                        "market_id":    mkt,
+                        "price_from":   round(p_start, 3),
+                        "price_to":     round(p_end, 3),
+                        "spike_pct":    round(abs(p_end - p_start) / p_start * 100, 1),
+                        "direction":    direction,
+                        "opportunity":  opp_side,
+                        "window_mins":  round(window_hrs * 60, 0),
+                    })
+                    break  # one alert per market
+
+    if contrarian_alerts:
+        log.info(f"  → {len(contrarian_alerts)} contrarian opportunities detected")
 
     # ── Step 3b: Coordinated swarm detection ─────────────────────────
     # Multiple new wallets entering same market within ±2h = coordinated swarm
@@ -316,7 +368,7 @@ def run():
 
     # ── Step 7: Send email ─────────────────────────────────────────────────────
     log.info("\n[7/7] Sending email report…")
-    ok = send_email(watchlist, stats)
+    ok = send_email(watchlist, stats, contrarian_alerts=contrarian_alerts)
     if ok:
         log.info("  → Email delivered successfully")
     else:
