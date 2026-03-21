@@ -25,24 +25,53 @@ WEIGHTS = {
     "immaculate_timing":     15,
     "longshot_win_rate":     20,
     "obfuscated_funding":    10,
-    "mixer_funding":         25,   # stronger signal
+    "mixer_funding":         25,
     "arkham_project_link":   20,
     "coordinated_cluster":   15,
     "dune_whale_flag":       10,
     "dune_new_wallet_flag":  10,
     # Anti-evasion signals
-    "cumulative_position":   20,   # smurfing: many small bets add up
-    "decoy_hedge":           15,   # fake hedge: tiny opposite bet to fool scanner
-    "coordinated_swarm":     25,   # multiple new wallets same market same time
-    "quick_flip":            15,   # buy then sell within 24h (swing, not conviction)
+    "cumulative_position":   20,
+    "decoy_hedge":           15,
+    "coordinated_swarm":     25,
+    "quick_flip":            15,
+    # Module A new signals
+    "capital_impact":        15,   # A1: bet > 10% of market TVL
+    "mixer_urgency":         30,   # A3: funds moved to bet within 1hr of deposit
 }
 
 # Anti-evasion thresholds
-CUMULATIVE_POSITION_MIN  = 10_000   # total across all bets in same market
-DECOY_HEDGE_RATIO        = 0.10     # minority side < 10% of majority = fake hedge
-COORDINATED_SWARM_HOURS  = 2        # wallets acting within ±2h = coordinated
-COORDINATED_SWARM_MIN    = 3        # min wallets to flag as swarm
-QUICK_FLIP_HOURS         = 24       # buy→sell within 24h = swing trade
+CUMULATIVE_POSITION_MIN  = 10_000
+DECOY_HEDGE_RATIO        = 0.10
+COORDINATED_SWARM_HOURS  = 2
+COORDINATED_SWARM_MIN    = 3
+QUICK_FLIP_HOURS         = 24
+
+# Module A thresholds
+CAPITAL_IMPACT_RATIO     = 0.10   # A1: bet >= 10% of TVL = high impact
+MIXER_URGENCY_HOURS      = 1.0    # A3: funded then bet within 1 hour = urgent
+
+# Module A2: Category score adjustments
+# Sports: -30 (no insider possible), Crypto/Finance: +10 (info asymmetry highest)
+CATEGORY_SCORE_ADJUST = {
+    "Sports":     0,   # no penalty — CAUTION_SPORTS_MARKET alert handles the warning
+    "Politics":   0,
+    "Finance":  +10,
+    "Crypto":   +10,
+    "Other":      0,
+}
+
+# Module B: Position sizing tiers based on final score
+TIER_THRESHOLDS = {
+    "Tier 3": 76,   # Sniper — strong insider signal
+    "Tier 2": 56,   # High confidence
+    "Tier 1": 40,   # Baseline observation
+}
+TIER_SIZING = {
+    "Tier 3": ("3–5%", "Take profit at 0.85–0.90, exit 70–80% of position"),
+    "Tier 2": ("2–3%", "Take profit at 0.85–0.90, exit 70–80% of position"),
+    "Tier 1": ("1–2%", "Observation only — wait for more confirming signals"),
+}
 
 
 def _parse_dt(raw):
@@ -114,6 +143,29 @@ def score_wallet(
         flags["large_bet_niche"] = True
     else:
         flags["large_bet_niche"] = False
+
+    # ── 2c. Capital Impact Ratio (A1) ─────────────────────────────────────────
+    # Bet that is ≥10% of market TVL has outsized influence → stronger insider signal
+    high_impact_trades = []
+    for t in recent_trades:
+        tvl   = float(t.get("_market_liquidity") or 0)
+        usdc  = float(t.get("usdcSize") or 0)
+        if tvl > 0 and usdc > 0:
+            ratio = usdc / tvl
+            if ratio >= CAPITAL_IMPACT_RATIO:
+                high_impact_trades.append({
+                    "market": t.get("_market_name", "?"),
+                    "bet_usdc": round(usdc, 0),
+                    "tvl": round(tvl, 0),
+                    "impact_pct": round(ratio * 100, 1),
+                })
+
+    flags["high_impact_trades"] = high_impact_trades
+    if high_impact_trades:
+        score += WEIGHTS["capital_impact"]
+        flags["capital_impact"] = True
+    else:
+        flags["capital_impact"] = False
 
     # ── 2b. Cumulative position (smurfing detection) ───────────────────────────
     # Sum all BUY trades per market — many small bets in same market = smurfing
@@ -249,6 +301,30 @@ def score_wallet(
     else:
         flags["bridge_flag"] = False
 
+    # ── 6b. Mixer urgency (A3): funded then bet within MIXER_URGENCY_HOURS ─────
+    # If wallet received USDC from mixer/bridge and then immediately placed a bet,
+    # this "urgency" is the highest-grade insider signal — they couldn't wait
+    mixer_urgency = False
+    inflows = polygon_data.get("usdc_inflows", [])
+    if inflows and (flags.get("mixer_flag") or flags.get("bridge_flag")):
+        first_bet_dt = None
+        for t in recent_trades:
+            ts = _parse_dt(t.get("timestamp") or t.get("createdAt"))
+            if ts and (first_bet_dt is None or ts < first_bet_dt):
+                first_bet_dt = ts
+        if first_bet_dt:
+            for inflow in inflows:
+                inflow_dt = datetime.fromtimestamp(inflow.get("timestamp", 0), tz=timezone.utc)
+                hours_gap = (first_bet_dt - inflow_dt).total_seconds() / 3600
+                if 0 <= hours_gap <= MIXER_URGENCY_HOURS:
+                    mixer_urgency = True
+                    flags["mixer_urgency_hours"] = round(hours_gap, 2)
+                    break
+
+    flags["mixer_urgency"] = mixer_urgency
+    if mixer_urgency:
+        score += WEIGHTS["mixer_urgency"]
+
     # ── 7. Arkham entity resolution ────────────────────────────────────────────
     arkham_label = arkham_data.get("label", "Unknown")
     arkham_type  = arkham_data.get("type", "unknown")
@@ -369,6 +445,39 @@ def score_wallet(
     # Sports market warning — insider info not possible in sports
     if any(p.get("category") == "Sports" for p in active_positions):
         alert_triggers.append("CAUTION_SPORTS_MARKET")
+    if flags.get("capital_impact"):
+        alert_triggers.append("ALERT_HIGH_CAPITAL_IMPACT")
+    if flags.get("mixer_urgency"):
+        alert_triggers.append("ALERT_MIXER_URGENCY")
+
+    # ── Module A2: Category score adjustment ──────────────────────────────────
+    # Adjust final score based on market category (sports penalised, crypto/finance boosted)
+    categories_in_positions = set(p.get("category", "Other") for p in active_positions)
+    category_adjustment = 0
+    dominant_category   = "Other"
+    if categories_in_positions:
+        # Use the category with the highest absolute adjustment
+        dominant_category = max(
+            categories_in_positions,
+            key=lambda c: abs(CATEGORY_SCORE_ADJUST.get(c, 0))
+        )
+        category_adjustment = CATEGORY_SCORE_ADJUST.get(dominant_category, 0)
+        score = max(0, score + category_adjustment)
+
+    flags["dominant_category"]   = dominant_category
+    flags["category_adjustment"] = category_adjustment
+
+    # ── Module B: Tier classification + position sizing ───────────────────────
+    if score >= TIER_THRESHOLDS["Tier 3"]:
+        tier = "Tier 3"
+    elif score >= TIER_THRESHOLDS["Tier 2"]:
+        tier = "Tier 2"
+    elif score >= TIER_THRESHOLDS["Tier 1"]:
+        tier = "Tier 1"
+    else:
+        tier = None
+
+    tier_sizing, tier_exit = TIER_SIZING.get(tier, ("—", "—")) if tier else ("—", "—")
 
     return {
         "wallet_address":   address,
@@ -388,5 +497,10 @@ def score_wallet(
         "polygon_tx_count":  polygon_data.get("tx_count", 0),
         "funding_warnings":  funding_flags,
         "alert_triggers":    alert_triggers,
+        "tier":              tier,
+        "tier_sizing":       tier_sizing,
+        "tier_exit":         tier_exit,
+        "dominant_category": dominant_category,
+        "category_adjustment": category_adjustment,
         "last_updated":      now.isoformat(),
     }
