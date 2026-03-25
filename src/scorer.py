@@ -58,7 +58,7 @@ MIXER_URGENCY_HOURS      = 1.0    # A3: funded then bet within 1 hour = urgent
 # Finance:  +15 — macro traders, Fed contacts, and earnings leaks create genuine asymmetry
 # Crypto:   +10 — on-chain data, team insiders, and exchange flow data create edge
 CATEGORY_SCORE_ADJUST = {
-    "Sports":    -30,
+    "Sports":    -10,
     "Politics":  +15,
     "Finance":   +15,
     "Crypto":    +10,
