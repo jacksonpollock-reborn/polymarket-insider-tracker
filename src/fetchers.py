@@ -45,22 +45,47 @@ def _get(url, params=None, headers=None, retries=3):
 
 # ── Markets ────────────────────────────────────────────────────────────────────
 
-def fetch_active_markets(limit=150):
+def fetch_active_markets(limit=150, tag_slug: str = None):
+    """
+    Fetch active Polymarket markets sorted by 24h volume.
+    Pass tag_slug to restrict to a specific category (e.g. 'politics', 'crypto').
+    """
     markets, offset = [], 0
     while len(markets) < limit:
-        batch = _get(f"{GAMMA_API}/markets", params={
+        params = {
             "active": "true", "closed": "false",
             "limit": 50, "offset": offset,
             "order": "volume24hr", "ascending": "false",
-        })
+        }
+        if tag_slug:
+            params["tag_slug"] = tag_slug
+        batch = _get(f"{GAMMA_API}/markets", params=params)
         if not batch:
             break
         markets.extend(batch)
         if len(batch) < 50:
             break
         offset += 50
-    log.info(f"[Polymarket] {len(markets)} active markets fetched")
+    log.info(f"[Polymarket] {len(markets)} active markets fetched" + (f" (tag={tag_slug})" if tag_slug else ""))
     return markets[:limit]
+
+
+def fetch_markets_by_tags(tag_slugs: list[str], per_tag_limit: int = 50) -> list[dict]:
+    """
+    Fetch markets for each tag slug and return a deduplicated combined list,
+    sorted by 24h volume descending. Used to prioritise non-sports categories.
+    """
+    seen, combined = set(), []
+    for tag in tag_slugs:
+        batch = fetch_active_markets(limit=per_tag_limit, tag_slug=tag)
+        for m in batch:
+            mid = m.get("conditionId") or m.get("condition_id") or m.get("id")
+            if mid and mid not in seen:
+                seen.add(mid)
+                combined.append(m)
+    # Sort combined by 24h volume desc so the best markets surface first
+    combined.sort(key=lambda m: float(m.get("volume24hr") or 0), reverse=True)
+    return combined
 
 
 # ── Trades per market ──────────────────────────────────────────────────────────
