@@ -298,8 +298,7 @@ def run():
     # Multiple new wallets entering same market within ±2h = coordinated swarm
     SWARM_HOURS = 2
     SWARM_MIN   = 3
-    from collections import defaultdict as _dd
-    market_wallet_times = _dd(list)
+    market_wallet_times = defaultdict(list)
     for t in all_trades:
         mkt  = t.get("_market_address", "")
         addr = (t.get("proxyWallet") or t.get("maker") or "").lower()

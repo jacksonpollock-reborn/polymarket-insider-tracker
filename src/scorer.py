@@ -52,7 +52,7 @@ CAPITAL_IMPACT_RATIO     = 0.10   # A1: bet >= 10% of TVL = high impact
 MIXER_URGENCY_HOURS      = 1.0    # A3: funded then bet within 1 hour = urgent
 
 # Module A2: Category score adjustments
-# Sports:   -30 — insider information essentially doesn't exist for sports outcomes
+# Sports:   -10 — insider information essentially doesn't exist for sports outcomes
 #                 (results are determined live with no informational edge possible beforehand)
 # Politics: +15 — government insiders, policy leaks, and early vote counts are real
 # Finance:  +15 — macro traders, Fed contacts, and earnings leaks create genuine asymmetry
