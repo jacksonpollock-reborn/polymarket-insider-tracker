@@ -52,13 +52,17 @@ CAPITAL_IMPACT_RATIO     = 0.10   # A1: bet >= 10% of TVL = high impact
 MIXER_URGENCY_HOURS      = 1.0    # A3: funded then bet within 1 hour = urgent
 
 # Module A2: Category score adjustments
-# Sports: 0 (uses CAUTION_SPORTS_MARKET alert instead), Crypto/Finance: +10 (info asymmetry highest)
+# Sports:   -10 — insider information essentially doesn't exist for sports outcomes
+#                 (results are determined live with no informational edge possible beforehand)
+# Politics: +15 — government insiders, policy leaks, and early vote counts are real
+# Finance:  +15 — macro traders, Fed contacts, and earnings leaks create genuine asymmetry
+# Crypto:   +10 — on-chain data, team insiders, and exchange flow data create edge
 CATEGORY_SCORE_ADJUST = {
-    "Sports":     0,   # no penalty — CAUTION_SPORTS_MARKET alert handles the warning
-    "Politics":   0,
-    "Finance":  +10,
-    "Crypto":   +10,
-    "Other":      0,
+    "Sports":    -10,
+    "Politics":  +15,
+    "Finance":   +15,
+    "Crypto":    +10,
+    "Other":       0,
 }
 
 # Module B: Position sizing tiers based on final score

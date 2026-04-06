@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from src.fetchers import (
     fetch_active_markets,
+    fetch_markets_by_tags,
     fetch_market_trades,
     fetch_wallet_activity,
     fetch_wallet_positions,
@@ -34,8 +35,20 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-MIN_SUSPICION_SCORE = int(os.environ.get("MIN_SUSPICION_SCORE", "40"))
+MIN_SUSPICION_SCORE  = int(os.environ.get("MIN_SUSPICION_SCORE", "40"))
 MAX_WALLETS_TO_SCORE = int(os.environ.get("MAX_WALLETS_TO_SCORE", "60"))
+
+# Category controls:
+#   PREFERRED_TAGS   — comma-separated Gamma API tag slugs to fetch first
+#                      (these markets are guaranteed slots regardless of overall volume rank)
+#   EXCLUDED_CATEGORIES — comma-separated category names (as detected by _detect_market_category)
+#                         that are dropped BEFORE scoring. Default: Sports.
+#
+# Gamma tag slugs that work: politics, crypto, economics, science, culture, sports
+_raw_preferred = os.environ.get("PREFERRED_TAGS", "politics,crypto,economics,science,culture")
+_raw_excluded  = os.environ.get("EXCLUDED_CATEGORIES", "")
+PREFERRED_TAGS       = [t.strip() for t in _raw_preferred.split(",") if t.strip()]
+EXCLUDED_CATEGORIES  = {c.strip() for c in _raw_excluded.split(",") if c.strip()}
 
 
 def flag_suspicious_markets(markets: list[dict]) -> list[dict]:
@@ -153,8 +166,34 @@ def run():
 
     # ── Step 1: Fetch markets ──────────────────────────────────────────────────
     log.info("\n[1/7] Fetching active Polymarket markets…")
-    markets = fetch_active_markets(limit=200)
+    log.info(f"  Preferred tags  : {PREFERRED_TAGS}")
+    log.info(f"  Excluded cats   : {EXCLUDED_CATEGORIES}")
+
+    # Phase 1a — targeted fetch for preferred categories (guaranteed slots)
+    targeted_markets = fetch_markets_by_tags(PREFERRED_TAGS, per_tag_limit=50) if PREFERRED_TAGS else []
+    targeted_ids     = {m.get("conditionId") or m.get("condition_id") or m.get("id") for m in targeted_markets}
+
+    # Phase 1b — top-200 by volume (fills in anything targeted fetch missed)
+    top_volume_markets = fetch_active_markets(limit=200)
+    for m in top_volume_markets:
+        mid = m.get("conditionId") or m.get("condition_id") or m.get("id")
+        if mid and mid not in targeted_ids:
+            targeted_markets.append(m)
+            targeted_ids.add(mid)
+
+    markets = targeted_markets
     stats["markets_scanned"] = len(markets)
+    log.info(f"  → {len(markets)} total unique markets fetched")
+
+    # Phase 1c — detect categories then drop excluded ones
+    for m in markets:
+        m["_detected_category"] = _detect_market_category(m)
+
+    pre_filter = len(markets)
+    if EXCLUDED_CATEGORIES:
+        markets = [m for m in markets if m["_detected_category"] not in EXCLUDED_CATEGORIES]
+        dropped = pre_filter - len(markets)
+        log.info(f"  → Dropped {dropped} {EXCLUDED_CATEGORIES} markets — {len(markets)} remain")
 
     flagged_markets = flag_suspicious_markets(markets)
     log.info(f"  → {len(flagged_markets)} markets flagged for deep scan")
@@ -196,7 +235,7 @@ def run():
                 t["_market_liquidity"] = float(m.get("liquidity") or 0)
                 t["_market_end"]       = m.get("endDateIso") or m.get("endDate")
                 t["_spike_ratio"]      = m.get("_spike_ratio", 0)
-                t["_market_category"]  = _detect_market_category(m)
+                t["_market_category"]  = m.get("_detected_category") or _detect_market_category(m)
                 t["usdcSize"]          = usdc
                 all_trades.append(t)
 
