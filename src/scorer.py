@@ -52,7 +52,7 @@ CAPITAL_IMPACT_RATIO     = 0.10   # A1: bet >= 10% of TVL = high impact
 MIXER_URGENCY_HOURS      = 1.0    # A3: funded then bet within 1 hour = urgent
 
 # Module A2: Category score adjustments
-# Sports: -30 (no insider possible), Crypto/Finance: +10 (info asymmetry highest)
+# Sports: 0 (uses CAUTION_SPORTS_MARKET alert instead), Crypto/Finance: +10 (info asymmetry highest)
 CATEGORY_SCORE_ADJUST = {
     "Sports":     0,   # no penalty — CAUTION_SPORTS_MARKET alert handles the warning
     "Politics":   0,
