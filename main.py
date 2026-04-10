@@ -19,6 +19,7 @@ from src.fetchers import (
     batch_scan_arb,
     fetch_active_markets,
     fetch_arkham_entity,
+    fetch_clob_book,
     fetch_dune_new_large_bettors,
     fetch_dune_whale_wallets,
     fetch_market_trades,
@@ -54,6 +55,7 @@ from src.tuning import (
     TUNING_SUMMARY_PATH,
     write_tuning_artifacts,
 )
+from src.paper_trader import update_paper_portfolio, portfolio_summary
 
 logging.basicConfig(
     level=logging.INFO,
@@ -646,12 +648,26 @@ def run():
     else:
         log.warning("  → Telegram skipped")
 
+    log.info("\n[Paper] Updating paper trading portfolio…")
+    paper_summary = update_paper_portfolio(
+        watchlist, market_trade_cache=market_trade_cache, fetch_clob_book=fetch_clob_book,
+    )
+    stats["paper_portfolio"] = paper_summary
+
     log.info("\n═══════════════════════════════════════════════════════")
     log.info(
         f"  Done. {stats['candidate_alerts']} candidates · {stats['flagged_alerts']} watchlist · "
         f"{stats['insider_watchlist']} insider · {stats['sports_watchlist']} sports/news · "
         f"{stats['momentum_watchlist']} momentum · {stats['contrarian_watchlist']} contrarian."
     )
+    if paper_summary:
+        log.info(
+            f"  Paper: ${paper_summary['current_equity']:.2f} equity · "
+            f"PnL ${paper_summary['total_pnl']:+.2f} · "
+            f"{paper_summary['open_positions']} open · "
+            f"{paper_summary['closed_trades']} closed · "
+            f"{'READY' if paper_summary['ready_for_real'] else 'NOT READY'}"
+        )
     log.info("═══════════════════════════════════════════════════════")
 
 

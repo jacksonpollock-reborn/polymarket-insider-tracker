@@ -8,6 +8,7 @@ review_log.json
 tuning_summary.json
 tuning_checklist.md
 report.html
+paper_portfolio.json
 
 # Python
 __pycache__/

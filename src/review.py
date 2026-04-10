@@ -90,6 +90,8 @@ def _upsert_entries(existing_entries: list[dict], alerts: list[dict]) -> dict[st
             "suggested_outcome": alert.get("suggested_outcome"),
             "recommended_action": alert.get("recommended_action"),
             "entry_price": _anchor_entry_price(alert),
+            "market_price_at_alert": alert.get("market_price_at_alert"),
+            "slippage_pct": alert.get("slippage_pct"),
             "price_after_1h": None,
             "price_after_6h": None,
             "price_after_24h": None,

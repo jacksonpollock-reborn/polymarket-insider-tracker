@@ -190,6 +190,19 @@ def send_telegram_alerts(watchlist: list[dict], stats: dict, arb_alerts: list | 
     if thin_edge_lines:
         ok = _send_block(["", "⚠️ *Thin-Edge Follow Alerts*", "Visible for monitoring, but entry price is already close to 1.00.", *thin_edge_lines]) and ok
 
+    paper = stats.get("paper_portfolio")
+    if paper and paper.get("total_trades", 0) > 0:
+        pnl = paper.get("total_pnl", 0)
+        pnl_sign = "\\+" if pnl >= 0 else ""
+        paper_lines = [
+            "", "📈 *Paper Portfolio*",
+            f"Equity: `${paper.get('current_equity', 100):.2f}` \\| P&L: `{pnl_sign}${abs(pnl):.2f}` \\({paper.get('total_pnl_pct', 0):+.1f}%\\)",
+            f"Open: {paper.get('open_positions', 0)} \\| Closed: {paper.get('closed_trades', 0)} \\| Win rate: {paper.get('win_rate_pct', 0):.0f}%",
+        ]
+        if paper.get("ready_for_real"):
+            paper_lines.append("✅ *READY for real trading*")
+        ok = _send_block(paper_lines) and ok
+
     ok = _send_block(["", "_Not financial advice\\. Always DYOR\\._"]) and ok
     return ok
 
@@ -437,6 +450,66 @@ def _build_thin_edge_section(grouped: dict[str, list[dict]]) -> str:
     )
 
 
+def _build_paper_section(stats: dict) -> str:
+    paper = stats.get("paper_portfolio")
+    if not paper:
+        return ""
+    pnl = paper.get("total_pnl", 0)
+    pnl_pct = paper.get("total_pnl_pct", 0)
+    pnl_color = "#68d391" if pnl >= 0 else "#fc8181"
+    ready = paper.get("ready_for_real", False)
+    ready_badge = (
+        '<span style="background:#2f855a;color:#68d391;font-size:10px;font-weight:700;padding:2px 8px;border-radius:999px;">READY</span>'
+        if ready else
+        f'<span style="background:#744210;color:#f6ad55;font-size:10px;font-weight:700;padding:2px 8px;border-radius:999px;">{_html(paper.get("ready_reason", "Collecting data"))}</span>'
+    )
+    bucket_rows = ""
+    for bucket, bp in paper.get("bucket_performance", {}).items():
+        if bp.get("trades", 0) == 0:
+            continue
+        bp_pnl = bp.get("pnl", 0)
+        bp_color = "#68d391" if bp_pnl >= 0 else "#fc8181"
+        wr = round(bp["wins"] / bp["trades"] * 100, 1) if bp["trades"] > 0 else 0
+        bucket_rows += (
+            f'<tr><td style="padding:4px 8px;color:#a0aec0;">{_html(BUCKET_LABELS.get(bucket, bucket))}</td>'
+            f'<td style="padding:4px 8px;text-align:center;">{bp["trades"]}</td>'
+            f'<td style="padding:4px 8px;text-align:center;color:#68d391;">{bp["wins"]}</td>'
+            f'<td style="padding:4px 8px;text-align:center;color:#fc8181;">{bp["losses"]}</td>'
+            f'<td style="padding:4px 8px;text-align:center;">{wr}%</td>'
+            f'<td style="padding:4px 8px;text-align:right;color:{bp_color};">${bp_pnl:+.2f}</td></tr>'
+        )
+
+    return f"""
+    <div style="background:#1a202c;border:1px solid #2d3748;border-radius:10px;padding:18px;margin-top:18px;">
+      <div style="font-size:16px;font-weight:800;color:#e2e8f0;margin-bottom:6px;">Paper Trading Portfolio {ready_badge}</div>
+      <div style="font-size:12px;color:#9ca3af;margin-bottom:14px;">Virtual $100 portfolio — auto-trades every watchlist alert</div>
+      <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:14px;">
+        <div style="flex:1;min-width:100px;text-align:center;">
+          <div style="font-size:24px;font-weight:800;color:#e2e8f0;">${paper.get('current_equity', 100):.2f}</div>
+          <div style="font-size:10px;color:#9ca3af;">Equity</div>
+        </div>
+        <div style="flex:1;min-width:100px;text-align:center;">
+          <div style="font-size:24px;font-weight:800;color:{pnl_color};">${pnl:+.2f}</div>
+          <div style="font-size:10px;color:#9ca3af;">P&amp;L ({pnl_pct:+.1f}%)</div>
+        </div>
+        <div style="flex:1;min-width:80px;text-align:center;">
+          <div style="font-size:24px;font-weight:800;color:#e2e8f0;">{paper.get('open_positions', 0)}</div>
+          <div style="font-size:10px;color:#9ca3af;">Open</div>
+        </div>
+        <div style="flex:1;min-width:80px;text-align:center;">
+          <div style="font-size:24px;font-weight:800;color:#e2e8f0;">{paper.get('closed_trades', 0)}</div>
+          <div style="font-size:10px;color:#9ca3af;">Closed</div>
+        </div>
+        <div style="flex:1;min-width:80px;text-align:center;">
+          <div style="font-size:24px;font-weight:800;color:#e2e8f0;">{paper.get('win_rate_pct', 0):.0f}%</div>
+          <div style="font-size:10px;color:#9ca3af;">Win Rate</div>
+        </div>
+      </div>
+      {f'<table style="width:100%;border-collapse:collapse;font-size:12px;"><thead><tr style="color:#9ca3af;"><th style="padding:4px 8px;text-align:left;">Bucket</th><th style="padding:4px 8px;">Trades</th><th style="padding:4px 8px;">W</th><th style="padding:4px 8px;">L</th><th style="padding:4px 8px;">Win%</th><th style="padding:4px 8px;text-align:right;">P&amp;L</th></tr></thead><tbody>{bucket_rows}</tbody></table>' if bucket_rows else ''}
+    </div>
+    """
+
+
 def build_html_report(
     watchlist: list[dict],
     run_date: str,
@@ -518,6 +591,7 @@ def build_html_report(
     {_build_arb_section(arb_alerts)}
     {body}
     {thin_edge_section}
+    {_build_paper_section(stats)}
 
     <div style="margin-top:24px;padding:16px;border-top:1px solid #2d3748;font-size:11px;color:#6b7280;text-align:center;">
       Generated by Polymarket Strategy Tracker. Informational only, not financial advice.

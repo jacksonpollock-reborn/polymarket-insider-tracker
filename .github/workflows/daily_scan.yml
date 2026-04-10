@@ -1,15 +1,10 @@
-name: Polymarket Insider Tracker
+name: Polymarket Strategy Tracker
 
 on:
   schedule:
   - cron: "0 1 * * *"   # 台北時間 09:00
   - cron: "0 14 * * *"  # 台北時間 22:00
   workflow_dispatch:
-    inputs:
-      min_score:
-        description: "Minimum suspicion score (default: 40)"
-        required: false
-        default: "40"
 
 jobs:
   run-tracker:
@@ -29,7 +24,19 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run insider tracker
+      - name: Restore paper portfolio
+        uses: actions/cache@v4
+        with:
+          path: paper_portfolio.json
+          key: paper-portfolio
+
+      - name: Restore review log
+        uses: actions/cache@v4
+        with:
+          path: review_log.json
+          key: review-log
+
+      - name: Run strategy tracker
         env:
           POLYGONSCAN_API_KEY:  ${{ secrets.POLYGONSCAN_API_KEY }}
           DUNE_API_KEY:         ${{ secrets.DUNE_API_KEY }}
@@ -37,14 +44,19 @@ jobs:
           GMAIL_USER:           ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD:   ${{ secrets.GMAIL_APP_PASSWORD }}
           EMAIL_TO:             ${{ secrets.EMAIL_TO }}
-          MIN_SUSPICION_SCORE:  ${{ github.event.inputs.min_score || '40' }}
           MAX_WALLETS_TO_SCORE: "60"
         run: python main.py
 
-      - name: Upload watchlist artifact
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: watchlist-${{ github.run_id }}
-          path: watchlist.json
+          name: tracker-run-${{ github.run_id }}
+          path: |
+            watchlist.json
+            review_log.json
+            paper_portfolio.json
+            tuning_summary.json
+            tuning_checklist.md
+            report.html
           retention-days: 30

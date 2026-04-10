@@ -40,8 +40,8 @@ CAPITAL_IMPACT_RATIO = 0.10
 MIXER_URGENCY_HOURS = 1.0
 SWARM_HOURS = 2
 SWARM_MIN_WALLETS = 3
-MAX_FOLLOW_ENTRY_PRICE = 0.90
-MIN_FOLLOW_REMAINING_EDGE = 0.10
+MAX_FOLLOW_ENTRY_PRICE = 0.75
+MIN_FOLLOW_REMAINING_EDGE = 0.25
 
 BUCKET_LABELS = {
     "insider": "Insider Strategy",
@@ -371,7 +371,7 @@ def _market_price_context(
         "late_chaser": bool(move_before_entry_pct is not None and move_before_entry_pct >= 0.12),
         "follow_through": bool(follow_through_pct is not None and follow_through_pct >= 0.06),
         "mean_reversion": bool(follow_through_pct is not None and follow_through_pct <= -0.06),
-        "overextended_move": abs(price_move_pct) >= 0.30 or rapid_move_pct >= 0.30,
+        "overextended_move": abs(price_move_pct) >= 0.20 or rapid_move_pct >= 0.20,
     }
 
 
@@ -694,7 +694,7 @@ def _score_momentum(shared: dict) -> int:
 
 def _score_contrarian(category: str, shared: dict) -> int:
     price_context = shared.get("price_context", {})
-    score = 0
+    score = min(shared.get("candidate_score", 0), 15)
     if price_context.get("overextended_move"):
         score += 12
     if shared.get("market_spike_ratio", 0) >= VOLUME_SPIKE_FACTOR:

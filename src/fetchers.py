@@ -318,8 +318,27 @@ def fetch_arkham_entity(address):
 
 # ── Arbitrage Scanner ──────────────────────────────────────────────────────────
 # Polymarket CLOB: YES ask + NO ask < 1.0 → guaranteed profit at resolution.
-# We use 0.97 as threshold (3¢ cushion for Polymarket's 2% fee + gas slippage).
-ARB_THRESHOLD = 0.97
+# With maker (limit) orders, Polymarket charges ZERO fees. With taker (market)
+# orders, the fee formula is: shares × feeRate × p × (1-p), where feeRate varies
+# by category (sports=0.03, crypto=0.072, politics=0.04, geopolitics=0).
+# Since arb execution should use limit orders for zero fees, the threshold is
+# set just below 1.0 to account for rounding and execution slippage only.
+ARB_THRESHOLD = float(os.environ.get("ARB_THRESHOLD", "0.995"))
+
+# Category-specific taker fee rates (only used if executing as taker)
+TAKER_FEE_RATES = {
+    "Sports": 0.03,
+    "Crypto": 0.072,
+    "Politics": 0.04,
+    "Finance": 0.04,
+    "Other": 0.05,
+}
+
+
+def estimate_taker_fee(shares: float, price: float, category: str = "Other") -> float:
+    """Estimate Polymarket taker fee: shares × feeRate × p × (1-p)."""
+    rate = TAKER_FEE_RATES.get(category, 0.05)
+    return shares * rate * price * (1 - price)
 
 def fetch_clob_book(token_id: str) -> dict:
     """
@@ -380,9 +399,16 @@ def scan_market_for_arb(market: dict) -> dict | None:
     # Max fillable at the best ask levels (limited by smaller side)
     max_fill_shares = min(yes_size, no_size)
     gross_profit_per_share = 1.0 - combined
-    # After Polymarket 2% fee on winning side (the $1.00 payout)
-    net_profit_per_share = gross_profit_per_share - 0.02
-    max_profit_usdc = round(net_profit_per_share * max_fill_shares, 2)
+    category = market.get("_detected_category", "Other")
+
+    # With limit orders (maker), fees are zero. Show both maker and taker P&L.
+    maker_profit_per_share = gross_profit_per_share
+    taker_fee_yes = estimate_taker_fee(1, yes_ask, category)
+    taker_fee_no = estimate_taker_fee(1, no_ask, category)
+    taker_profit_per_share = gross_profit_per_share - taker_fee_yes - taker_fee_no
+
+    max_profit_maker = round(maker_profit_per_share * max_fill_shares, 2)
+    max_profit_taker = round(taker_profit_per_share * max_fill_shares, 2)
 
     return {
         "market":            market.get("question") or market.get("title", ""),
@@ -390,14 +416,16 @@ def scan_market_for_arb(market: dict) -> dict | None:
         "yes_ask":           round(yes_ask, 4),
         "no_ask":            round(no_ask, 4),
         "combined":          round(combined, 4),
-        "arb_pct":           round((1.0 - combined) * 100, 2),     # gross %
-        "net_arb_pct":       round(net_profit_per_share * 100, 2), # after fee
+        "arb_pct":           round(gross_profit_per_share * 100, 2),
+        "net_arb_pct":       round(maker_profit_per_share * 100, 2),
+        "taker_arb_pct":     round(taker_profit_per_share * 100, 2),
         "max_fill_shares":   round(max_fill_shares, 0),
-        "max_profit_usdc":   max_profit_usdc,
+        "max_profit_usdc":   max_profit_maker,
+        "max_profit_taker":  max_profit_taker,
         "yes_token_id":      yes_id,
         "no_token_id":       no_id,
         "liquidity":         float(market.get("liquidity") or 0),
-        "category":          market.get("_detected_category", "Other"),
+        "category":          category,
         "days_to_end":       market.get("_days_to_end", 0),
     }
 
