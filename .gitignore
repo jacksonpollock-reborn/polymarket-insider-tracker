@@ -1,0 +1,25 @@
+# Secrets
+.env
+.env.*
+
+# Runtime artifacts (regenerated every run)
+watchlist.json
+review_log.json
+tuning_summary.json
+tuning_checklist.md
+report.html
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Claude / Codex working directories
+.claude/
+.codex/
+CLAUDE.md
+
+# OS
+.DS_Store

@@ -1,75 +1,66 @@
 """
-scorer.py — Computes a Suspicion Score (0–100+) for each wallet.
-Uses all available data sources; degrades gracefully if some are missing.
+scorer.py — Scores wallet+market alerts across four strategy buckets.
 """
 
+from __future__ import annotations
+
+import hashlib
 import logging
-from datetime import datetime, timezone
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 
 log = logging.getLogger(__name__)
 
-# ── Scoring thresholds ─────────────────────────────────────────────────────────
-MIN_BET_USDC           = 5_000
-MAX_NICHE_TVL          = 200_000
-WALLET_AGE_DAYS        = 30
-TIMING_HOURS           = 72
-LONGSHOT_THRESHOLD     = 0.20
-MIN_LONGSHOT_WIN_RATE  = 0.60
-VOLUME_SPIKE_FACTOR    = 3.0
-
-# ── Score weights ──────────────────────────────────────────────────────────────
-WEIGHTS = {
-    "new_wallet":            20,
-    "large_bet_niche":       20,
-    "zero_hedge":            15,
-    "immaculate_timing":     15,
-    "longshot_win_rate":     20,
-    "obfuscated_funding":    10,
-    "mixer_funding":         25,
-    "arkham_project_link":   20,
-    "coordinated_cluster":   15,
-    "dune_whale_flag":       10,
-    "dune_new_wallet_flag":  10,
-    # Anti-evasion signals
-    "cumulative_position":   20,
-    "decoy_hedge":           15,
-    "coordinated_swarm":     25,
-    "quick_flip":            15,
-    # Module A new signals
-    "capital_impact":        15,   # A1: bet > 10% of market TVL
-    "mixer_urgency":         30,   # A3: funds moved to bet within 1hr of deposit
+# ── Scan thresholds ────────────────────────────────────────────────────────────
+MIN_BET_USDC = 5_000
+MAX_NICHE_TVL = 200_000
+WALLET_AGE_DAYS = 30
+TIMING_HOURS = 72
+SPORTS_TIMING_HOURS = 24
+LONGSHOT_THRESHOLD = 0.20
+MIN_LONGSHOT_WIN_RATE = 0.60
+MIN_RESOLVED_HISTORY = 8
+MIN_RESOLVED_LONGSHOT_HISTORY = 3
+VOLUME_SPIKE_FACTOR = 3.0
+DEFAULT_MIN_CANDIDATE_SCORE = 20
+DEFAULT_BUCKET_THRESHOLDS = {
+    "insider": 40,
+    "sports_news": 32,
+    "momentum": 35,
+    "contrarian": 35,
 }
 
-# Anti-evasion thresholds
-CUMULATIVE_POSITION_MIN  = 10_000
-DECOY_HEDGE_RATIO        = 0.10
-COORDINATED_SWARM_HOURS  = 2
-COORDINATED_SWARM_MIN    = 3
-QUICK_FLIP_HOURS         = 24
+# ── Feature thresholds ─────────────────────────────────────────────────────────
+CUMULATIVE_POSITION_MIN = 10_000
+DECOY_HEDGE_RATIO = 0.10
+BALANCED_HEDGE_RATIO = 0.35
+QUICK_FLIP_HOURS = 24
+QUICK_FLIP_MIN_USDC = 1_000
+CAPITAL_IMPACT_RATIO = 0.10
+MIXER_URGENCY_HOURS = 1.0
+SWARM_HOURS = 2
+SWARM_MIN_WALLETS = 3
+MAX_FOLLOW_ENTRY_PRICE = 0.90
+MIN_FOLLOW_REMAINING_EDGE = 0.10
 
-# Module A thresholds
-CAPITAL_IMPACT_RATIO     = 0.10   # A1: bet >= 10% of TVL = high impact
-MIXER_URGENCY_HOURS      = 1.0    # A3: funded then bet within 1 hour = urgent
-
-# Module A2: Category score adjustments
-# Sports:   -10 — insider information essentially doesn't exist for sports outcomes
-#                 (results are determined live with no informational edge possible beforehand)
-# Politics: +15 — government insiders, policy leaks, and early vote counts are real
-# Finance:  +15 — macro traders, Fed contacts, and earnings leaks create genuine asymmetry
-# Crypto:   +10 — on-chain data, team insiders, and exchange flow data create edge
-CATEGORY_SCORE_ADJUST = {
-    "Sports":    -10,
-    "Politics":  +15,
-    "Finance":   +15,
-    "Crypto":    +10,
-    "Other":       0,
+BUCKET_LABELS = {
+    "insider": "Insider Strategy",
+    "sports_news": "Sports News Strategy",
+    "momentum": "Momentum Strategy",
+    "contrarian": "Contrarian Strategy",
 }
+BUCKET_PRIORITY = {
+    "insider": 0,
+    "sports_news": 1,
+    "contrarian": 2,
+    "momentum": 3,
+}
+FOLLOW_BUCKETS = {"insider", "sports_news", "momentum"}
 
-# Module B: Position sizing tiers based on final score
 TIER_THRESHOLDS = {
-    "Tier 3": 76,   # Sniper — strong insider signal
-    "Tier 2": 56,   # High confidence
-    "Tier 1": 40,   # Baseline observation
+    "Tier 3": 76,
+    "Tier 2": 56,
+    "Tier 1": 40,
 }
 TIER_SIZING = {
     "Tier 3": ("3–5%", "Take profit at 0.85–0.90, exit 70–80% of position"),
@@ -93,418 +84,835 @@ def _parse_dt(raw):
             return None
 
 
-def score_wallet(
+def _clamp(value, minimum=0, maximum=100):
+    return max(minimum, min(maximum, value))
+
+
+def _trade_usdc(trade: dict) -> float:
+    raw = trade.get("usdcSize")
+    if raw not in (None, ""):
+        try:
+            return float(raw)
+        except Exception:
+            pass
+
+    size = float(trade.get("size") or 0)
+    price = float(trade.get("price") or 0)
+    if size and price:
+        return size * price
+    return size
+
+
+def _normalize_outcome(trade: dict) -> str:
+    outcome = str(trade.get("outcome") or trade.get("name") or "").strip().upper()
+    return outcome or "UNKNOWN"
+
+
+def wallet_from_trade(trade: dict) -> str:
+    return (
+        trade.get("proxyWallet")
+        or trade.get("maker")
+        or trade.get("transactor")
+        or trade.get("address")
+        or ""
+    ).lower().strip()
+
+
+def market_from_trade(trade: dict) -> str:
+    return (
+        trade.get("_market_address")
+        or trade.get("conditionId")
+        or trade.get("condition_id")
+        or ""
+    )
+
+
+def trade_time(trade: dict):
+    return _parse_dt(
+        trade.get("timestamp")
+        or trade.get("createdAt")
+        or trade.get("created_at")
+    )
+
+
+def _weighted_price(trades: list[dict]) -> float | None:
+    weighted_sum = 0.0
+    total_usdc = 0.0
+    for trade in trades:
+        usdc = _trade_usdc(trade)
+        price = float(trade.get("price") or 0)
+        if usdc <= 0 or price <= 0:
+            continue
+        weighted_sum += usdc * price
+        total_usdc += usdc
+    if total_usdc <= 0:
+        return None
+    return weighted_sum / total_usdc
+
+
+def _summarize_recent_trades(trades: list[dict]) -> list[dict]:
+    rows = []
+    for trade in sorted(trades, key=lambda item: trade_time(item) or datetime.min.replace(tzinfo=timezone.utc)):
+        rows.append({
+            "timestamp": (trade_time(trade) or datetime.now(timezone.utc)).isoformat(),
+            "side": (trade.get("side") or "BUY").upper(),
+            "outcome": _normalize_outcome(trade),
+            "price": round(float(trade.get("price") or 0), 4),
+            "amount_usdc": round(_trade_usdc(trade), 2),
+        })
+    return rows
+
+
+def _opposite_outcome(outcome: str | None) -> str | None:
+    if not outcome:
+        return None
+    outcome = outcome.upper()
+    if outcome == "YES":
+        return "NO"
+    if outcome == "NO":
+        return "YES"
+    return None
+
+
+def _detect_quick_flips(polymarket_activity: list[dict], market_id: str, dominant_outcome: str | None) -> list[dict]:
+    events = []
+    for activity in polymarket_activity:
+        activity_market = (
+            activity.get("conditionId")
+            or activity.get("market")
+            or activity.get("_market_address")
+            or ""
+        )
+        if activity_market != market_id:
+            continue
+        dt = _parse_dt(activity.get("timestamp") or activity.get("createdAt") or activity.get("created_at"))
+        if not dt:
+            continue
+        side = (activity.get("side") or activity.get("type") or "").upper()
+        amount = _trade_usdc(activity)
+        if amount < QUICK_FLIP_MIN_USDC:
+            continue
+        events.append({
+            "dt": dt,
+            "side": side,
+            "amount": amount,
+            "outcome": _normalize_outcome(activity),
+        })
+
+    events.sort(key=lambda item: item["dt"])
+    open_buys = []
+    flip_events = []
+
+    for event in events:
+        if event["side"] == "BUY":
+            open_buys.append(event)
+            continue
+        if event["side"] != "SELL":
+            continue
+
+        matched = None
+        for buy in open_buys:
+            if dominant_outcome and buy["outcome"] not in {dominant_outcome, "UNKNOWN"}:
+                continue
+            if event["outcome"] not in {buy["outcome"], "UNKNOWN"}:
+                continue
+            hours_held = (event["dt"] - buy["dt"]).total_seconds() / 3600
+            if 0 < hours_held <= QUICK_FLIP_HOURS:
+                matched = {
+                    "hours_held": round(hours_held, 1),
+                    "buy_usdc": round(buy["amount"], 2),
+                }
+                break
+        if matched:
+            flip_events.append(matched)
+            break
+
+    return flip_events
+
+
+def _extract_wallet_history(positions: list[dict]) -> dict:
+    longshot_wins = 0
+    longshot_total = 0
+    total_wins = 0
+    total_resolved = 0
+
+    for position in positions:
+        outcome = str(position.get("outcome") or "").lower()
+        is_resolved = outcome in {"won", "lost", "redeemed", "expired"}
+        if not is_resolved:
+            continue
+
+        total_resolved += 1
+        cash_pnl = float(position.get("cashPnl") or 0)
+        is_won = outcome in {"won", "redeemed"} or cash_pnl > 0
+        if is_won:
+            total_wins += 1
+
+        avg_price_raw = position.get("avgPrice") or position.get("price")
+        try:
+            avg_price = float(avg_price_raw) if avg_price_raw not in (None, "") else None
+        except Exception:
+            avg_price = None
+
+        if avg_price is not None and avg_price <= LONGSHOT_THRESHOLD:
+            longshot_total += 1
+            if is_won:
+                longshot_wins += 1
+
+    longshot_win_rate = (
+        longshot_wins / longshot_total
+        if longshot_total >= MIN_RESOLVED_LONGSHOT_HISTORY else None
+    )
+    overall_win_rate = (
+        total_wins / total_resolved
+        if total_resolved >= MIN_RESOLVED_HISTORY else None
+    )
+
+    return {
+        "total_resolved": total_resolved,
+        "total_wins": total_wins,
+        "overall_win_rate": round(overall_win_rate, 2) if overall_win_rate is not None else None,
+        "longshot_total": longshot_total,
+        "longshot_wins": longshot_wins,
+        "longshot_win_rate": round(longshot_win_rate, 2) if longshot_win_rate is not None else None,
+        "overall_history_flag": bool(overall_win_rate is not None and overall_win_rate >= 0.62),
+        "longshot_flag": bool(
+            longshot_win_rate is not None
+            and total_resolved >= MIN_RESOLVED_HISTORY
+            and longshot_win_rate >= MIN_LONGSHOT_WIN_RATE
+        ),
+    }
+
+
+def _max_window_move_pct(price_points: list[tuple[datetime, float]], window_hours: float = 1.0) -> float:
+    max_move = 0.0
+    for idx, (start_dt, start_price) in enumerate(price_points):
+        if start_price <= 0:
+            continue
+        for end_dt, end_price in price_points[idx + 1:]:
+            hours = (end_dt - start_dt).total_seconds() / 3600
+            if hours > window_hours:
+                break
+            max_move = max(max_move, abs(end_price - start_price) / start_price)
+    return max_move
+
+
+def _market_price_context(
+    market_trades: list[dict],
+    dominant_outcome: str | None,
+    first_alert_dt,
+    last_alert_dt,
+    entry_price: float | None,
+) -> dict:
+    outcome_trades = []
+    for trade in market_trades:
+        if dominant_outcome and _normalize_outcome(trade) != dominant_outcome:
+            continue
+        dt = trade_time(trade)
+        price = float(trade.get("price") or 0)
+        if dt and price > 0:
+            outcome_trades.append((dt, price))
+
+    outcome_trades.sort(key=lambda item: item[0])
+    if not outcome_trades:
+        return {
+            "outcome_trade_count": 0,
+            "price_move_pct": 0.0,
+            "rapid_move_pct": 0.0,
+            "pre_alert_price": None,
+            "post_alert_price": None,
+            "move_before_entry_pct": None,
+            "follow_through_pct": None,
+            "max_favorable_excursion_pct": None,
+            "max_adverse_excursion_pct": None,
+            "price_acceleration": False,
+            "late_chaser": False,
+            "follow_through": False,
+            "mean_reversion": False,
+            "overextended_move": False,
+        }
+
+    first_price = outcome_trades[0][1]
+    last_price = outcome_trades[-1][1]
+    price_move_pct = ((last_price - first_price) / first_price) if first_price else 0.0
+    rapid_move_pct = _max_window_move_pct(outcome_trades, 1.0)
+
+    pre_alert_points = [item for item in outcome_trades if item[0] < first_alert_dt]
+    post_alert_points = [item for item in outcome_trades if item[0] > last_alert_dt]
+    pre_alert_price = pre_alert_points[-1][1] if pre_alert_points else first_price
+    post_alert_price = post_alert_points[-1][1] if post_alert_points else last_price
+
+    move_before_entry_pct = None
+    follow_through_pct = None
+    max_favorable_excursion_pct = None
+    max_adverse_excursion_pct = None
+    if entry_price and entry_price > 0:
+        if pre_alert_price:
+            move_before_entry_pct = (entry_price - pre_alert_price) / pre_alert_price
+        follow_through_pct = (post_alert_price - entry_price) / entry_price
+        future_prices = [price for dt, price in outcome_trades if dt >= first_alert_dt]
+        if future_prices:
+            max_favorable_excursion_pct = (max(future_prices) - entry_price) / entry_price
+            max_adverse_excursion_pct = (min(future_prices) - entry_price) / entry_price
+
+    return {
+        "outcome_trade_count": len(outcome_trades),
+        "first_price": round(first_price, 4),
+        "last_price": round(last_price, 4),
+        "price_move_pct": round(price_move_pct, 4),
+        "rapid_move_pct": round(rapid_move_pct, 4),
+        "pre_alert_price": round(pre_alert_price, 4) if pre_alert_price is not None else None,
+        "post_alert_price": round(post_alert_price, 4) if post_alert_price is not None else None,
+        "move_before_entry_pct": round(move_before_entry_pct, 4) if move_before_entry_pct is not None else None,
+        "follow_through_pct": round(follow_through_pct, 4) if follow_through_pct is not None else None,
+        "max_favorable_excursion_pct": round(max_favorable_excursion_pct, 4) if max_favorable_excursion_pct is not None else None,
+        "max_adverse_excursion_pct": round(max_adverse_excursion_pct, 4) if max_adverse_excursion_pct is not None else None,
+        "price_acceleration": rapid_move_pct >= 0.12,
+        "late_chaser": bool(move_before_entry_pct is not None and move_before_entry_pct >= 0.12),
+        "follow_through": bool(follow_through_pct is not None and follow_through_pct >= 0.06),
+        "mean_reversion": bool(follow_through_pct is not None and follow_through_pct <= -0.06),
+        "overextended_move": abs(price_move_pct) >= 0.30 or rapid_move_pct >= 0.30,
+    }
+
+
+def _build_shared_features(
     address: str,
-    recent_trades: list[dict],        # trades in flagged markets (last 24h)
-    polymarket_activity: list[dict],  # full wallet history on Polymarket
+    market: dict,
+    alert_trades: list[dict],
+    market_trades: list[dict],
+    polymarket_activity: list[dict],
     positions: list[dict],
     polygon_data: dict,
     arkham_data: dict,
     dune_whale_list: list[str],
     dune_new_wallet_list: list[str],
-    is_swarm_wallet: bool = False,    # flagged by cross-wallet swarm detection
-) -> dict:
-    """Returns a scored wallet record ready for the watchlist."""
+    swarm_cluster_size: int = 0,
+) -> tuple[dict, dict, dict]:
+    now = datetime.now(timezone.utc)
+    alert_trades = sorted(alert_trades, key=lambda trade: trade_time(trade) or now)
+    market_id = market.get("market_id") or market.get("conditionId") or market_from_trade(alert_trades[0])
+    category = market.get("category") or alert_trades[0].get("_market_category") or "Other"
+    market_name = market.get("market_name") or alert_trades[0].get("_market_name") or market_id
+    market_end = market.get("market_end") or alert_trades[0].get("_market_end")
+    market_end_dt = _parse_dt(market_end)
+    market_liquidity = float(market.get("market_liquidity") or alert_trades[0].get("_market_liquidity") or 0)
+    market_spike_ratio = float(market.get("spike_ratio") or alert_trades[0].get("_spike_ratio") or 0)
 
-    now   = datetime.now(timezone.utc)
-    score = 0
-    flags = {}
+    outcome_buys = defaultdict(float)
+    outcome_net = defaultdict(float)
+    dominant_buy_trades = defaultdict(list)
+    buy_usdc = 0.0
+    sell_usdc = 0.0
+    largest_trade_usdc = 0.0
+    large_buy_count = 0
+    first_trade_dt = None
+    last_trade_dt = None
+    repeated_adds = 0
+    last_buy_dt = None
 
-    # ── 1. Wallet age on Polymarket ────────────────────────────────────────────
+    for trade in alert_trades:
+        dt = trade_time(trade)
+        if dt:
+            first_trade_dt = dt if first_trade_dt is None or dt < first_trade_dt else first_trade_dt
+            last_trade_dt = dt if last_trade_dt is None or dt > last_trade_dt else last_trade_dt
+
+        usdc = _trade_usdc(trade)
+        largest_trade_usdc = max(largest_trade_usdc, usdc)
+        outcome = _normalize_outcome(trade)
+        side = (trade.get("side") or "BUY").upper()
+        if side == "BUY":
+            buy_usdc += usdc
+            if usdc >= MIN_BET_USDC:
+                large_buy_count += 1
+            outcome_buys[outcome] += usdc
+            dominant_buy_trades[outcome].append(trade)
+            if last_buy_dt and dt and (dt - last_buy_dt) >= timedelta(minutes=15):
+                repeated_adds += 1
+            if dt:
+                last_buy_dt = dt
+            outcome_net[outcome] += usdc
+        else:
+            sell_usdc += usdc
+            outcome_net[outcome] -= usdc
+
+    positive_exposures = {
+        outcome: amount
+        for outcome, amount in outcome_net.items()
+        if amount > 0
+    }
+    if positive_exposures:
+        dominant_outcome, dominant_usdc = max(positive_exposures.items(), key=lambda item: item[1])
+        secondary_usdc = sum(amount for outcome, amount in positive_exposures.items() if outcome != dominant_outcome)
+    else:
+        dominant_outcome, dominant_usdc, secondary_usdc = "UNKNOWN", 0.0, 0.0
+
+    hedge_ratio = (secondary_usdc / dominant_usdc) if dominant_usdc > 0 else 0.0
+    directional_conviction = bool(dominant_usdc > 0 and (len(positive_exposures) == 1 or hedge_ratio < DECOY_HEDGE_RATIO))
+    balanced_outcomes = bool(dominant_usdc > 0 and hedge_ratio >= BALANCED_HEDGE_RATIO)
+    decoy_exposure = bool(dominant_usdc > 0 and 0 < hedge_ratio < DECOY_HEDGE_RATIO and len(positive_exposures) > 1)
+    entry_price = _weighted_price(dominant_buy_trades.get(dominant_outcome, []))
+    remaining_edge_pct = max(0.0, 1 - entry_price) if entry_price is not None else None
+    low_remaining_edge = bool(
+        entry_price is not None and (
+            entry_price >= MAX_FOLLOW_ENTRY_PRICE
+            or remaining_edge_pct < MIN_FOLLOW_REMAINING_EDGE
+        )
+    )
+    capital_impact_ratio = (dominant_usdc / market_liquidity) if market_liquidity > 0 else 0.0
+
+    timing_hours = None
+    if first_trade_dt and market_end_dt:
+        timing_hours = (market_end_dt - first_trade_dt).total_seconds() / 3600
+    true_timing = bool(timing_hours is not None and 0 < timing_hours <= TIMING_HOURS)
+    sports_timing = bool(timing_hours is not None and 0 < timing_hours <= SPORTS_TIMING_HOURS)
+
+    quick_flips = _detect_quick_flips(polymarket_activity, market_id, dominant_outcome)
+    price_context = _market_price_context(
+        market_trades=market_trades,
+        dominant_outcome=dominant_outcome,
+        first_alert_dt=first_trade_dt or now,
+        last_alert_dt=last_trade_dt or now,
+        entry_price=entry_price,
+    )
+
     timestamps = []
-    for a in polymarket_activity:
-        dt = _parse_dt(a.get("timestamp") or a.get("createdAt") or a.get("created_at"))
+    for activity in polymarket_activity:
+        dt = _parse_dt(activity.get("timestamp") or activity.get("createdAt") or activity.get("created_at"))
         if dt:
             timestamps.append(dt)
-
-    # Also use Polygonscan first-tx as a fallback
     poly_first = polygon_data.get("first_tx_timestamp")
     if poly_first:
         timestamps.append(datetime.fromtimestamp(int(poly_first), tz=timezone.utc))
+    wallet_age_days = (now - min(timestamps)).days if timestamps else None
+    wallet_age_confident = bool(poly_first) or (0 < len(polymarket_activity) < 500)
+    new_wallet = bool(wallet_age_confident and wallet_age_days is not None and wallet_age_days < WALLET_AGE_DAYS)
 
-    age_days = None
-    if timestamps:
-        age_days = (now - min(timestamps)).days
-        if age_days < WALLET_AGE_DAYS:
-            score += WEIGHTS["new_wallet"]
-            flags["new_wallet"] = True
-        else:
-            flags["new_wallet"] = False
-    else:
-        flags["new_wallet"] = False
+    historical_record = _extract_wallet_history(positions)
 
-    flags["wallet_age_days"] = age_days
-
-    # ── 2. Large bet in low-liquidity (niche) market ───────────────────────────
-    niche_trades = [
-        t for t in recent_trades
-        if float(t.get("_market_liquidity", MAX_NICHE_TVL + 1)) < MAX_NICHE_TVL
-        and float(t.get("usdcSize") or t.get("size") or 0) >= MIN_BET_USDC
-    ]
-    flags["niche_market_bets"] = len(niche_trades)
-    if niche_trades:
-        score += WEIGHTS["large_bet_niche"]
-        flags["large_bet_niche"] = True
-    else:
-        flags["large_bet_niche"] = False
-
-    # ── 2c. Capital Impact Ratio (A1) ─────────────────────────────────────────
-    # Bet that is ≥10% of market TVL has outsized influence → stronger insider signal
-    high_impact_trades = []
-    for t in recent_trades:
-        tvl   = float(t.get("_market_liquidity") or 0)
-        usdc  = float(t.get("usdcSize") or 0)
-        if tvl > 0 and usdc > 0:
-            ratio = usdc / tvl
-            if ratio >= CAPITAL_IMPACT_RATIO:
-                high_impact_trades.append({
-                    "market": t.get("_market_name", "?"),
-                    "bet_usdc": round(usdc, 0),
-                    "tvl": round(tvl, 0),
-                    "impact_pct": round(ratio * 100, 1),
-                })
-
-    flags["high_impact_trades"] = high_impact_trades
-    if high_impact_trades:
-        score += WEIGHTS["capital_impact"]
-        flags["capital_impact"] = True
-    else:
-        flags["capital_impact"] = False
-
-    # ── 2b. Cumulative position (smurfing detection) ───────────────────────────
-    # Sum all BUY trades per market — many small bets in same market = smurfing
-    market_totals: dict[str, float] = {}
-    for t in recent_trades:
-        if (t.get("side") or "").upper() != "BUY":
-            continue
-        mkt = t.get("_market_address") or t.get("_market_name") or "unknown"
-        market_totals[mkt] = market_totals.get(mkt, 0) + float(t.get("usdcSize") or 0)
-
-    smurf_markets = {m: v for m, v in market_totals.items() if v >= CUMULATIVE_POSITION_MIN}
-    flags["smurf_markets"]       = list(smurf_markets.keys())
-    flags["cumulative_max_usdc"] = round(max(market_totals.values()), 2) if market_totals else 0
-
-    if smurf_markets:
-        score += WEIGHTS["cumulative_position"]
-        flags["cumulative_position"] = True
-    else:
-        flags["cumulative_position"] = False
-
-    # ── 3. Zero-hedge + Decoy-hedge detection ────────────────────────────────
-    # Redemptions = any trade at price ~1.00 — not real trading behaviour
-    # Real trades never occur at price >= 0.99 (max payout is $1.00 per share)
-    real_trades = [
-        t for t in recent_trades
-        if float(t.get("price") or 0) < 0.99
-    ]
-
-    buy_usdc  = sum(float(t.get("usdcSize") or 0) for t in real_trades if (t.get("side") or "").upper() == "BUY")
-    sell_usdc = sum(float(t.get("usdcSize") or 0) for t in real_trades if (t.get("side") or "").upper() == "SELL")
-    total_usdc = buy_usdc + sell_usdc
-
-    sides = set()
-    if buy_usdc  > 0: sides.add("BUY")
-    if sell_usdc > 0: sides.add("SELL")
-
-    flags["sides_traded"] = list(sides)
-    flags["buy_usdc"]     = round(buy_usdc, 2)
-    flags["sell_usdc"]    = round(sell_usdc, 2)
-
-    # True zero-hedge: only one side
-    if len(sides) == 1 and len(real_trades) >= 2:
-        score += WEIGHTS["zero_hedge"]
-        flags["zero_hedge"]   = True
-        flags["decoy_hedge"]  = False
-    elif len(sides) == 2 and total_usdc > 0:
-        # Decoy-hedge: both sides exist but minority is < DECOY_HEDGE_RATIO of majority
-        minority = min(buy_usdc, sell_usdc)
-        majority = max(buy_usdc, sell_usdc)
-        hedge_ratio = minority / majority if majority > 0 else 0
-        flags["hedge_ratio"] = round(hedge_ratio, 3)
-        if hedge_ratio < DECOY_HEDGE_RATIO:
-            # Tiny opposite bet — treating as effectively zero-hedge
-            score += WEIGHTS["zero_hedge"]
-            score += WEIGHTS["decoy_hedge"]
-            flags["zero_hedge"]  = True   # functionally unhedged
-            flags["decoy_hedge"] = True   # but tried to fake it
-        else:
-            flags["zero_hedge"]  = False
-            flags["decoy_hedge"] = False
-    else:
-        flags["zero_hedge"]  = False
-        flags["decoy_hedge"] = False
-
-    # ── 4. Immaculate timing: bet within TIMING_HOURS of resolution ────────────
-    timing_hits = []
-    for t in recent_trades:
-        end_dt = _parse_dt(t.get("_market_end"))
-        if not end_dt:
-            continue
-        hours_left = (end_dt - now).total_seconds() / 3600
-        if 0 < hours_left < TIMING_HOURS:
-            timing_hits.append({
-                "market": t.get("_market_name", "?"),
-                "hours_to_resolution": round(hours_left, 1),
-            })
-
-    flags["timing_hits"] = timing_hits
-    if timing_hits:
-        score += WEIGHTS["immaculate_timing"]
-        flags["immaculate_timing"] = True
-    else:
-        flags["immaculate_timing"] = False
-
-    # ── 5. Longshot win rate ───────────────────────────────────────────────────
-    longshot_wins  = 0
-    longshot_total = 0
-    total_wins     = 0
-    total_resolved = 0
-
-    for p in positions:
-        outcome   = (p.get("outcome") or "").lower()
-        avg_price = float(p.get("avgPrice") or p.get("curPrice") or 0.5)
-        is_won    = outcome in ("won", "redeemed") or float(p.get("cashPnl") or 0) > 0
-
-        if outcome in ("won", "lost", "redeemed", "expired"):
-            total_resolved += 1
-            if is_won:
-                total_wins += 1
-
-        if avg_price <= LONGSHOT_THRESHOLD:
-            longshot_total += 1
-            if is_won:
-                longshot_wins += 1
-
-    longshot_win_rate = (longshot_wins / longshot_total) if longshot_total >= 2 else None
-    flags["longshot_total"]    = longshot_total
-    flags["longshot_wins"]     = longshot_wins
-    flags["longshot_win_rate"] = round(longshot_win_rate, 2) if longshot_win_rate is not None else None
-    flags["total_wins"]        = total_wins
-    flags["total_resolved"]    = total_resolved
-    flags["overall_win_rate"]  = round(total_wins / total_resolved, 2) if total_resolved > 0 else None
-
-    if longshot_win_rate is not None and longshot_win_rate >= MIN_LONGSHOT_WIN_RATE:
-        score += WEIGHTS["longshot_win_rate"]
-        flags["longshot_flag"] = True
-    else:
-        flags["longshot_flag"] = False
-
-    # ── 6. Obfuscated / bridge funding (Polygonscan) ──────────────────────────
     funding_flags = polygon_data.get("funding_flags", [])
-    flags["funding_flags"] = funding_flags
-
-    if any("mixer" in f.lower() for f in funding_flags):
-        score += WEIGHTS["mixer_funding"]
-        flags["mixer_flag"] = True
-    else:
-        flags["mixer_flag"] = False
-
-    if any("bridge" in f.lower() for f in funding_flags):
-        score += WEIGHTS["obfuscated_funding"]
-        flags["bridge_flag"] = True
-    else:
-        flags["bridge_flag"] = False
-
-    # ── 6b. Mixer urgency (A3): funded then bet within MIXER_URGENCY_HOURS ─────
-    # If wallet received USDC from mixer/bridge and then immediately placed a bet,
-    # this "urgency" is the highest-grade insider signal — they couldn't wait
-    mixer_urgency = False
     inflows = polygon_data.get("usdc_inflows", [])
-    if inflows and (flags.get("mixer_flag") or flags.get("bridge_flag")):
-        first_bet_dt = None
-        for t in recent_trades:
-            ts = _parse_dt(t.get("timestamp") or t.get("createdAt"))
-            if ts and (first_bet_dt is None or ts < first_bet_dt):
-                first_bet_dt = ts
-        if first_bet_dt:
-            for inflow in inflows:
-                inflow_dt = datetime.fromtimestamp(inflow.get("timestamp", 0), tz=timezone.utc)
-                hours_gap = (first_bet_dt - inflow_dt).total_seconds() / 3600
-                if 0 <= hours_gap <= MIXER_URGENCY_HOURS:
-                    mixer_urgency = True
-                    flags["mixer_urgency_hours"] = round(hours_gap, 2)
-                    break
+    mixer_flag = any("mixer" in flag.lower() for flag in funding_flags)
+    bridge_flag = any("bridge" in flag.lower() for flag in funding_flags)
 
-    flags["mixer_urgency"] = mixer_urgency
-    if mixer_urgency:
-        score += WEIGHTS["mixer_urgency"]
+    mixer_urgency = False
+    mixer_urgency_hours = None
+    if inflows and mixer_flag and first_trade_dt:
+        for inflow in inflows:
+            inflow_dt = datetime.fromtimestamp(inflow.get("timestamp", 0), tz=timezone.utc)
+            hours_gap = (first_trade_dt - inflow_dt).total_seconds() / 3600
+            if 0 <= hours_gap <= MIXER_URGENCY_HOURS:
+                mixer_urgency = True
+                mixer_urgency_hours = round(hours_gap, 2)
+                break
 
-    # ── 7. Arkham entity resolution ────────────────────────────────────────────
     arkham_label = arkham_data.get("label", "Unknown")
-    arkham_type  = arkham_data.get("type", "unknown")
-    flags["arkham_label"]   = arkham_label
-    flags["arkham_type"]    = arkham_type
-    flags["arkham_website"] = arkham_data.get("website")
-    flags["arkham_cluster"] = arkham_data.get("cluster_size", 0)
-    flags["related_wallets"] = arkham_data.get("related_addresses", [])
-
+    arkham_type = arkham_data.get("type", "unknown")
     project_types = {"project", "treasury", "developer", "team", "fund", "institution"}
-    if arkham_type.lower() in project_types or (
-        arkham_label != "Unknown" and any(k in arkham_label.lower() for k in ["fund", "capital", "ventures"])
-    ):
-        score += WEIGHTS["arkham_project_link"]
-        flags["arkham_project_link"] = True
-    else:
-        flags["arkham_project_link"] = False
+    arkham_project_link = bool(
+        str(arkham_type).lower() in project_types
+        or (arkham_label != "Unknown" and any(key in arkham_label.lower() for key in ["fund", "capital", "ventures"]))
+    )
+    coordinated_cluster = bool(arkham_data.get("cluster_size", 0) >= 3)
 
-    if arkham_data.get("cluster_size", 0) >= 3:
-        score += WEIGHTS["coordinated_cluster"]
-        flags["coordinated_cluster"] = True
-    else:
-        flags["coordinated_cluster"] = False
-
-    # ── 8. Dune cross-reference ────────────────────────────────────────────────
     addr_lower = address.lower()
-    flags["dune_whale_flag"]      = addr_lower in [w.lower() for w in dune_whale_list if w]
-    flags["dune_new_wallet_flag"] = addr_lower in [w.lower() for w in dune_new_wallet_list if w]
+    dune_whale_flag = addr_lower in {wallet.lower() for wallet in dune_whale_list if wallet}
+    dune_new_wallet_flag = addr_lower in {wallet.lower() for wallet in dune_new_wallet_list if wallet}
 
-    if flags["dune_whale_flag"]:
-        score += WEIGHTS["dune_whale_flag"]
-    if flags["dune_new_wallet_flag"]:
-        score += WEIGHTS["dune_new_wallet_flag"]
+    recent_buy_evidence = bool(large_buy_count or buy_usdc >= MIN_BET_USDC or dominant_usdc >= MIN_BET_USDC)
+    candidate_score = 0
+    if recent_buy_evidence:
+        candidate_score += 12
+    if largest_trade_usdc >= MIN_BET_USDC and market_liquidity and market_liquidity < MAX_NICHE_TVL:
+        candidate_score += 10
+    if capital_impact_ratio >= CAPITAL_IMPACT_RATIO:
+        candidate_score += 12
+    if dominant_usdc >= CUMULATIVE_POSITION_MIN:
+        candidate_score += 8
+    if directional_conviction:
+        candidate_score += 12
+    if true_timing:
+        candidate_score += 10
+    if swarm_cluster_size >= SWARM_MIN_WALLETS:
+        candidate_score += 8
+    if balanced_outcomes:
+        candidate_score -= 10
+    if quick_flips:
+        candidate_score -= 15
 
-    # ── 8b. Coordinated swarm (cross-wallet, detected in main.py) ─────────────
-    flags["coordinated_swarm"] = is_swarm_wallet
-    if is_swarm_wallet:
-        score += WEIGHTS["coordinated_swarm"]
+    shared = {
+        "trade_count": len(alert_trades),
+        "recent_buy_usdc": round(buy_usdc, 2),
+        "recent_sell_usdc": round(sell_usdc, 2),
+        "gross_trade_usdc": round(buy_usdc + sell_usdc, 2),
+        "largest_trade_usdc": round(largest_trade_usdc, 2),
+        "large_trade_count": large_buy_count,
+        "cumulative_position_usdc": round(dominant_usdc, 2),
+        "capital_impact_ratio": round(capital_impact_ratio, 4),
+        "capital_impact_pct": round(capital_impact_ratio * 100, 2),
+        "market_liquidity": round(market_liquidity, 2),
+        "market_spike_ratio": round(market_spike_ratio, 2),
+        "directional_conviction": directional_conviction,
+        "balanced_outcomes": balanced_outcomes,
+        "decoy_exposure": decoy_exposure,
+        "hedge_ratio": round(hedge_ratio, 4),
+        "dominant_outcome": dominant_outcome,
+        "dominant_entry_price": round(entry_price, 4) if entry_price is not None else None,
+        "remaining_edge_pct": round(remaining_edge_pct, 4) if remaining_edge_pct is not None else None,
+        "low_remaining_edge": low_remaining_edge,
+        "timing_hours_to_resolution": round(timing_hours, 2) if timing_hours is not None else None,
+        "true_timing": true_timing,
+        "sports_event_timing": sports_timing,
+        "swarm_cluster_size": swarm_cluster_size,
+        "coordinated_swarm": swarm_cluster_size >= SWARM_MIN_WALLETS,
+        "quick_flips": quick_flips,
+        "quick_flip": bool(quick_flips),
+        "wallet_age_days": wallet_age_days,
+        "wallet_age_confident": wallet_age_confident,
+        "new_wallet": new_wallet,
+        "funding_flags": funding_flags,
+        "mixer_flag": mixer_flag,
+        "bridge_flag": bridge_flag,
+        "mixer_urgency": mixer_urgency,
+        "mixer_urgency_hours": mixer_urgency_hours,
+        "arkham_label": arkham_label,
+        "arkham_type": arkham_type,
+        "arkham_project_link": arkham_project_link,
+        "coordinated_cluster": coordinated_cluster,
+        "arkham_cluster": arkham_data.get("cluster_size", 0),
+        "related_wallets": arkham_data.get("related_addresses", []),
+        "dune_whale_flag": dune_whale_flag,
+        "dune_new_wallet_flag": dune_new_wallet_flag,
+        "price_context": price_context,
+        "candidate_score": candidate_score,
+    }
+    shared.update(historical_record)
 
-    # ── 9. Quick-flip detection (swing trade, not conviction) ────────────────
-    # Look in full wallet activity for BUY→SELL in same market within QUICK_FLIP_HOURS
-    flip_events = []
-    activity_by_market: dict[str, list] = {}
-    for a in polymarket_activity:
-        mkt = a.get("conditionId") or a.get("market") or ""
-        if mkt:
-            activity_by_market.setdefault(mkt, []).append(a)
+    active_exposure = {
+        "dominant_outcome": dominant_outcome,
+        "dominant_usdc": round(dominant_usdc, 2),
+        "secondary_usdc": round(secondary_usdc, 2),
+        "hedge_ratio": round(hedge_ratio, 4),
+        "net_outcome_exposures": {key: round(value, 2) for key, value in sorted(outcome_net.items())},
+        "entry_price": round(entry_price, 4) if entry_price is not None else None,
+        "buy_usdc": round(buy_usdc, 2),
+        "sell_usdc": round(sell_usdc, 2),
+    }
 
-    for mkt, acts in activity_by_market.items():
-        buys  = [a for a in acts if (a.get("side") or a.get("type") or "").upper() in ("BUY",)]
-        sells = [a for a in acts if (a.get("side") or a.get("type") or "").upper() in ("SELL",)
-                 and float(a.get("price") or 0) < 0.99]   # exclude redemptions
-        for b in buys:
-            b_dt = _parse_dt(b.get("timestamp") or b.get("createdAt"))
-            if not b_dt:
-                continue
-            for s in sells:
-                s_dt = _parse_dt(s.get("timestamp") or s.get("createdAt"))
-                if not s_dt:
-                    continue
-                hours_held = (s_dt - b_dt).total_seconds() / 3600
-                if 0 < hours_held < QUICK_FLIP_HOURS:
-                    flip_events.append({
-                        "market":      mkt,
-                        "hours_held":  round(hours_held, 1),
-                        "buy_usdc":    float(b.get("usdcSize") or b.get("size") or 0),
-                    })
+    metadata = {
+        "market_id": market_id,
+        "market_name": market_name,
+        "category": category,
+        "market_end": market_end,
+        "market_liquidity": market_liquidity,
+        "spike_ratio": market_spike_ratio,
+        "generated_at": now.isoformat(),
+    }
+    return shared, active_exposure, metadata
 
-    flags["quick_flips"] = flip_events
-    if flip_events:
-        score += WEIGHTS["quick_flip"]
-        flags["quick_flip"] = True
-    else:
-        flags["quick_flip"] = False
 
-    # ── Build active positions summary (exclude redemptions) ─────────────────
-    active_positions = []
-    for t in recent_trades:
-        price_val = float(t.get("price") or 0)
-        side      = (t.get("side") or "BUY").upper()
-        # Skip all redemptions — price >= 0.99 means resolved market payout (both BUY and SELL)
-        if price_val >= 0.99:
-            continue
-        outcome  = t.get("outcome") or t.get("name") or ""  # e.g. "Overpass", "Yes", "No"
-        category = t.get("_market_category", "Other")
-        active_positions.append({
-            "market_name":      t.get("_market_name", "Unknown"),
-            "market_address":   t.get("_market_address", ""),
-            "side":             side,
-            "outcome":          outcome,   # ← specific position purchased
-            "category":         category,  # ← Sports / Politics / Crypto / Finance / Other
-            "amount_usdc":      float(t.get("usdcSize") or t.get("size") or 0),
-            "entry_price":      float(t.get("price") or 0),
-            "market_liquidity": float(t.get("_market_liquidity") or 0),
-            "market_end":       t.get("_market_end"),
-            "days_to_end":      t.get("_days_to_end"),
-            "spike_ratio":      t.get("_spike_ratio", 0),
-        })
+def _score_insider(category: str, shared: dict) -> int:
+    score = shared["candidate_score"]
+    if category == "Sports":
+        score -= 18
+    if shared.get("new_wallet"):
+        score += 8
+    if shared.get("longshot_flag"):
+        score += 15
+    if shared.get("overall_history_flag"):
+        score += 8
+    if shared.get("bridge_flag"):
+        score += 5
+    if shared.get("mixer_flag"):
+        score += 25
+    if shared.get("mixer_urgency"):
+        score += 15
+    if shared.get("arkham_project_link"):
+        score += 15
+    if shared.get("coordinated_cluster"):
+        score += 10
+    if shared.get("dune_whale_flag"):
+        score += 4
+    if shared.get("dune_new_wallet_flag"):
+        score += 6
+    if shared.get("price_context", {}).get("late_chaser"):
+        score -= 10
+    if shared.get("price_context", {}).get("mean_reversion"):
+        score -= 8
+    return _clamp(score)
 
-    # ── Alert triggers ────────────────────────────────────────────────────────
-    alert_triggers = []
-    if any(p["amount_usdc"] >= 5000 for p in active_positions):
-        alert_triggers.append("ALERT_NEW_LARGE_POSITION")
-    if any(p["market_liquidity"] < 50_000 for p in active_positions):
-        alert_triggers.append("ALERT_NICHE_MARKET")
-    if flags.get("immaculate_timing"):
-        alert_triggers.append("ALERT_TIMING_SNIPE")
-    if flags.get("mixer_flag"):
-        alert_triggers.append("ALERT_SUSPICIOUS_FUNDING")
-    if flags.get("cumulative_position"):
-        alert_triggers.append("ALERT_SMURF_DETECTED")
-    if flags.get("decoy_hedge"):
-        alert_triggers.append("ALERT_FAKE_HEDGE")
-    if flags.get("coordinated_swarm"):
-        alert_triggers.append("ALERT_COORDINATED_SWARM")
-    if flags.get("quick_flip"):
-        alert_triggers.append("ALERT_QUICK_FLIP")
-    # Sports market warning — insider info not possible in sports
-    if any(p.get("category") == "Sports" for p in active_positions):
-        alert_triggers.append("CAUTION_SPORTS_MARKET")
-    if flags.get("capital_impact"):
-        alert_triggers.append("ALERT_HIGH_CAPITAL_IMPACT")
-    if flags.get("mixer_urgency"):
-        alert_triggers.append("ALERT_MIXER_URGENCY")
 
-    # ── Module A2: Category score adjustment ──────────────────────────────────
-    # Adjust final score based on market category (sports penalised, crypto/finance boosted)
-    categories_in_positions = set(p.get("category", "Other") for p in active_positions)
-    category_adjustment = 0
-    dominant_category   = "Other"
-    if categories_in_positions:
-        # Use the category with the highest absolute adjustment
-        dominant_category = max(
-            categories_in_positions,
-            key=lambda c: abs(CATEGORY_SCORE_ADJUST.get(c, 0))
-        )
-        category_adjustment = CATEGORY_SCORE_ADJUST.get(dominant_category, 0)
-        score = max(0, score + category_adjustment)
+def _score_sports_news(category: str, shared: dict) -> int:
+    if category != "Sports":
+        return 0
+    score = shared["candidate_score"]
+    if shared.get("sports_event_timing"):
+        score += 12
+    if shared.get("capital_impact_ratio", 0) >= CAPITAL_IMPACT_RATIO:
+        score += 8
+    if shared.get("coordinated_swarm"):
+        score += 8
+    if shared.get("directional_conviction"):
+        score += 8
+    if shared.get("overall_history_flag"):
+        score += 6
+    if shared.get("price_context", {}).get("follow_through"):
+        score += 6
+    if shared.get("price_context", {}).get("late_chaser"):
+        score -= 8
+    if shared.get("balanced_outcomes"):
+        score -= 8
+    if shared.get("quick_flip"):
+        score -= 12
+    if shared.get("price_context", {}).get("mean_reversion"):
+        score -= 10
+    return _clamp(score)
 
-    flags["dominant_category"]   = dominant_category
-    flags["category_adjustment"] = category_adjustment
 
-    # ── Module B: Tier classification + position sizing ───────────────────────
-    if score >= TIER_THRESHOLDS["Tier 3"]:
+def _score_momentum(shared: dict) -> int:
+    score = min(shared["candidate_score"], 20)
+    price_context = shared.get("price_context", {})
+    if price_context.get("price_acceleration"):
+        score += 10
+    if shared.get("market_spike_ratio", 0) >= VOLUME_SPIKE_FACTOR:
+        score += 8
+    if price_context.get("follow_through"):
+        score += 10
+    if shared.get("trade_count", 0) >= 3:
+        score += 6
+    if shared.get("directional_conviction"):
+        score += 8
+    if shared.get("balanced_outcomes"):
+        score -= 12
+    if shared.get("quick_flip"):
+        score -= 8
+    if price_context.get("mean_reversion"):
+        score -= 10
+    if price_context.get("overextended_move") and not price_context.get("follow_through"):
+        score -= 8
+    return _clamp(score)
+
+
+def _score_contrarian(category: str, shared: dict) -> int:
+    price_context = shared.get("price_context", {})
+    score = 0
+    if price_context.get("overextended_move"):
+        score += 12
+    if shared.get("market_spike_ratio", 0) >= VOLUME_SPIKE_FACTOR:
+        score += 8
+    if price_context.get("late_chaser"):
+        score += 10
+    if price_context.get("mean_reversion"):
+        score += 10
+    if not shared.get("directional_conviction"):
+        score += 6
+    if shared.get("balanced_outcomes"):
+        score += 6
+    if shared.get("true_timing") and price_context.get("overextended_move"):
+        score += 6
+    if shared.get("quick_flip"):
+        score += 4
+    if shared.get("arkham_project_link") or shared.get("mixer_flag"):
+        score -= 15
+    if shared.get("longshot_flag") or shared.get("overall_history_flag"):
+        score -= 8
+    if category == "Sports" and shared.get("sports_event_timing") and shared.get("directional_conviction"):
+        score -= 10
+    if shared.get("coordinated_swarm"):
+        score -= 6
+    return _clamp(score)
+
+
+def _choose_bucket(bucket_scores: dict[str, int], thresholds: dict[str, int]) -> tuple[str, int, int]:
+    best_bucket = sorted(
+        bucket_scores,
+        key=lambda bucket: (-bucket_scores[bucket], BUCKET_PRIORITY[bucket]),
+    )[0]
+    return best_bucket, bucket_scores[best_bucket], thresholds[best_bucket]
+
+
+def _build_core_reasons(bucket: str, shared: dict, active_exposure: dict) -> list[str]:
+    reasons = []
+    if shared.get("directional_conviction"):
+        reasons.append(f"One-sided exposure into {active_exposure.get('dominant_outcome', 'UNKNOWN')}")
+    if shared.get("capital_impact_ratio", 0) >= CAPITAL_IMPACT_RATIO:
+        reasons.append(f"Position size is {shared['capital_impact_pct']:.1f}% of market liquidity")
+    if shared.get("true_timing"):
+        reasons.append(f"Trade landed {shared.get('timing_hours_to_resolution')}h before resolution")
+    if shared.get("coordinated_swarm"):
+        reasons.append(f"Joined a {shared.get('swarm_cluster_size', 0)}-wallet cluster inside {SWARM_HOURS}h")
+    if bucket == "insider" and shared.get("arkham_project_link"):
+        reasons.append("Arkham links the wallet to a project/fund-style entity")
+    if bucket == "insider" and shared.get("mixer_flag"):
+        reasons.append("Funding flow includes mixer-style behavior")
+    if bucket == "sports_news" and shared.get("sports_event_timing"):
+        reasons.append("Sports entry landed inside the late-news event window")
+    if bucket == "sports_news" and shared.get("price_context", {}).get("follow_through"):
+        reasons.append("Price continued moving after the entry")
+    if bucket == "momentum" and shared.get("price_context", {}).get("price_acceleration"):
+        reasons.append("Outcome price accelerated sharply in the last hour")
+    if bucket == "momentum" and shared.get("price_context", {}).get("follow_through"):
+        reasons.append("The move kept running after the alert entry")
+    if bucket == "contrarian" and shared.get("price_context", {}).get("overextended_move"):
+        reasons.append("The market already looks overstretched")
+    if bucket == "contrarian" and shared.get("price_context", {}).get("late_chaser"):
+        reasons.append("Entry came after a large price move")
+    if bucket == "contrarian" and shared.get("price_context", {}).get("mean_reversion"):
+        reasons.append("Price has started reversing after the entry")
+    return reasons[:4]
+
+
+def _build_caution_flags(shared: dict) -> list[str]:
+    cautions = []
+    if shared.get("balanced_outcomes"):
+        cautions.append("Exposure is split across outcomes")
+    if shared.get("quick_flip"):
+        cautions.append("Wallet showed quick-flip behavior in this market")
+    if not shared.get("wallet_age_confident"):
+        cautions.append("Wallet age may be truncated by limited history")
+    if shared.get("price_context", {}).get("mean_reversion"):
+        cautions.append("Price has already started mean-reverting")
+    if shared.get("price_context", {}).get("late_chaser"):
+        cautions.append("Entry may be late relative to the move")
+    if shared.get("low_remaining_edge"):
+        cautions.append("Entry is too close to 1.00 to leave much remaining edge")
+    return cautions
+
+
+def _build_action(bucket: str, dominant_outcome: str | None) -> tuple[str, str | None]:
+    opposite = _opposite_outcome(dominant_outcome)
+    if bucket in FOLLOW_BUCKETS:
+        if dominant_outcome:
+            return "follow", dominant_outcome
+        return "follow", None
+    if opposite:
+        return "fade", opposite
+    return "fade", None
+
+
+def _build_alert_id(address: str, market_id: str, first_trade_dt) -> str:
+    minute_key = ""
+    if first_trade_dt:
+        minute_key = first_trade_dt.replace(second=0, microsecond=0).isoformat()
+    raw = f"{address.lower()}|{market_id}|{minute_key}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def score_alert(
+    address: str,
+    market: dict,
+    alert_trades: list[dict],
+    market_trades: list[dict],
+    polymarket_activity: list[dict],
+    positions: list[dict],
+    polygon_data: dict,
+    arkham_data: dict,
+    dune_whale_list: list[str],
+    dune_new_wallet_list: list[str],
+    swarm_cluster_size: int = 0,
+    min_candidate_score: int = DEFAULT_MIN_CANDIDATE_SCORE,
+    bucket_thresholds: dict[str, int] | None = None,
+) -> dict:
+    bucket_thresholds = bucket_thresholds or DEFAULT_BUCKET_THRESHOLDS
+    shared, active_exposure, metadata = _build_shared_features(
+        address=address,
+        market=market,
+        alert_trades=alert_trades,
+        market_trades=market_trades,
+        polymarket_activity=polymarket_activity,
+        positions=positions,
+        polygon_data=polygon_data,
+        arkham_data=arkham_data,
+        dune_whale_list=dune_whale_list,
+        dune_new_wallet_list=dune_new_wallet_list,
+        swarm_cluster_size=swarm_cluster_size,
+    )
+
+    category = metadata["category"]
+    candidate_score = shared["candidate_score"]
+    is_candidate = bool(
+        active_exposure.get("dominant_usdc", 0) >= MIN_BET_USDC
+        and candidate_score >= min_candidate_score
+    )
+
+    bucket_scores = {
+        "insider": _score_insider(category, shared),
+        "sports_news": _score_sports_news(category, shared),
+        "momentum": _score_momentum(shared),
+        "contrarian": _score_contrarian(category, shared),
+    }
+    best_bucket, best_score, bucket_threshold = _choose_bucket(bucket_scores, bucket_thresholds)
+    strategy_label = BUCKET_LABELS[best_bucket]
+    review_status = "pending"
+    alert_time = trade_time(alert_trades[0]) if alert_trades else None
+    alert_id = _build_alert_id(address, metadata["market_id"], alert_time)
+
+    if best_score >= TIER_THRESHOLDS["Tier 3"]:
         tier = "Tier 3"
-    elif score >= TIER_THRESHOLDS["Tier 2"]:
+    elif best_score >= TIER_THRESHOLDS["Tier 2"]:
         tier = "Tier 2"
-    elif score >= TIER_THRESHOLDS["Tier 1"]:
+    elif best_score >= TIER_THRESHOLDS["Tier 1"]:
         tier = "Tier 1"
     else:
         tier = None
-
     tier_sizing, tier_exit = TIER_SIZING.get(tier, ("—", "—")) if tier else ("—", "—")
 
+    action_mode, suggested_outcome = _build_action(best_bucket, active_exposure.get("dominant_outcome"))
+    review_anchor_price = active_exposure.get("entry_price")
+    thin_edge_follow = bool(action_mode == "follow" and shared.get("low_remaining_edge"))
+    passes_strategy_threshold = bool(is_candidate and best_score >= bucket_threshold)
+    strategy_blockers = []
+
     return {
-        "wallet_address":   address,
-        "suspicion_score":  score,
-        "score_breakdown":  flags,
-        "entity_label":     arkham_label,
-        "entity_type":      arkham_type,
-        "active_positions": active_positions,
+        "alert_id": alert_id,
+        "wallet_address": address,
+        "market_id": metadata["market_id"],
+        "market_name": metadata["market_name"],
+        "category": category,
+        "market_end": metadata["market_end"],
+        "generated_at": metadata["generated_at"],
+        "review_status": review_status,
+        "recent_trades": _summarize_recent_trades(alert_trades),
+        "active_exposure": active_exposure,
+        "shared_features": shared,
+        "score_breakdown": shared,
+        "bucket_scores": bucket_scores,
+        "best_bucket": best_bucket,
+        "best_score": best_score,
+        "bucket_threshold": bucket_threshold,
+        "candidate_score": candidate_score,
+        "candidate_threshold": min_candidate_score,
+        "is_candidate": is_candidate,
+        "passes_strategy_threshold": passes_strategy_threshold,
+        "strategy_blockers": strategy_blockers,
+        "thin_edge_follow": thin_edge_follow,
+        "strategy_bucket": best_bucket,
+        "strategy_label": strategy_label,
+        "strategy_score": best_score,
+        "strategy_threshold": bucket_threshold,
+        "suspicion_score": best_score,
+        "core_reasons": _build_core_reasons(best_bucket, shared, active_exposure),
+        "caution_flags": _build_caution_flags(shared),
+        "entity_label": shared.get("arkham_label", "Unknown"),
+        "entity_type": shared.get("arkham_type", "unknown"),
         "historical_record": {
-            "total_resolved":    total_resolved,
-            "total_wins":        total_wins,
-            "overall_win_rate":  flags["overall_win_rate"],
-            "longshot_total":    longshot_total,
-            "longshot_wins":     longshot_wins,
-            "longshot_win_rate": flags["longshot_win_rate"],
+            "total_resolved": shared.get("total_resolved", 0),
+            "total_wins": shared.get("total_wins", 0),
+            "overall_win_rate": shared.get("overall_win_rate"),
+            "longshot_total": shared.get("longshot_total", 0),
+            "longshot_wins": shared.get("longshot_wins", 0),
+            "longshot_win_rate": shared.get("longshot_win_rate"),
         },
-        "polygon_tx_count":  polygon_data.get("tx_count", 0),
-        "funding_warnings":  funding_flags,
-        "alert_triggers":    alert_triggers,
-        "tier":              tier,
-        "tier_sizing":       tier_sizing,
-        "tier_exit":         tier_exit,
-        "dominant_category": dominant_category,
-        "category_adjustment": category_adjustment,
-        "last_updated":      now.isoformat(),
+        "polygon_tx_count": polygon_data.get("tx_count", 0),
+        "funding_warnings": shared.get("funding_flags", []),
+        "tier": tier,
+        "tier_sizing": tier_sizing,
+        "tier_exit": tier_exit,
+        "recommended_action": action_mode,
+        "suggested_outcome": suggested_outcome,
+        "review_anchor_price": review_anchor_price,
+        "review_label": None,
     }
+
+
+def bucket_label(bucket: str) -> str:
+    return BUCKET_LABELS.get(bucket, bucket.title())

@@ -1,32 +1,59 @@
 """
-main.py — Orchestrates the full insider-detection pipeline.
-Run directly or triggered by GitHub Actions.
+main.py — Orchestrates the full strategy-alert pipeline.
 """
+
+from __future__ import annotations
 
 import json
 import logging
 import os
+import re
 import sys
+import time
 from collections import defaultdict
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 
-# Allow running from project root
 sys.path.insert(0, os.path.dirname(__file__))
 
 from src.fetchers import (
+    batch_scan_arb,
     fetch_active_markets,
-    fetch_markets_by_tags,
+    fetch_arkham_entity,
+    fetch_dune_new_large_bettors,
+    fetch_dune_whale_wallets,
     fetch_market_trades,
+    fetch_markets_by_tags,
+    fetch_polygon_tx_history,
     fetch_wallet_activity,
     fetch_wallet_positions,
-    fetch_polygon_tx_history,
-    fetch_arkham_entity,
-    fetch_dune_volume_spikes,
-    fetch_dune_whale_wallets,
-    fetch_dune_new_large_bettors,
+    get_request_health,
+    reset_request_health,
 )
-from src.scorer import score_wallet, MIN_BET_USDC, MAX_NICHE_TVL, VOLUME_SPIKE_FACTOR
-from src.reporter import send_email
+from src.reporter import send_email, send_telegram_alerts, write_html_report
+from src.review import (
+    DEFAULT_REVIEW_LOG_PATH,
+    load_review_log,
+    summarize_review_log,
+    sync_review_log,
+)
+from src.scorer import (
+    DEFAULT_BUCKET_THRESHOLDS,
+    DEFAULT_MIN_CANDIDATE_SCORE,
+    MAX_NICHE_TVL,
+    MIN_BET_USDC,
+    SWARM_HOURS,
+    SWARM_MIN_WALLETS,
+    VOLUME_SPIKE_FACTOR,
+    market_from_trade,
+    score_alert,
+    trade_time,
+    wallet_from_trade,
+)
+from src.tuning import (
+    TUNING_CHECKLIST_PATH,
+    TUNING_SUMMARY_PATH,
+    write_tuning_artifacts,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -35,386 +62,596 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-MIN_SUSPICION_SCORE  = int(os.environ.get("MIN_SUSPICION_SCORE", "40"))
+MIN_CANDIDATE_SCORE = int(os.environ.get("MIN_CANDIDATE_SCORE", str(DEFAULT_MIN_CANDIDATE_SCORE)))
 MAX_WALLETS_TO_SCORE = int(os.environ.get("MAX_WALLETS_TO_SCORE", "60"))
+MARKET_TRADE_LIMIT = int(os.environ.get("MARKET_TRADE_LIMIT", "100"))
+BOOTSTRAP_RETRY_COUNT = int(os.environ.get("BOOTSTRAP_RETRY_COUNT", "1"))
+BOOTSTRAP_RETRY_DELAY_SECONDS = int(os.environ.get("BOOTSTRAP_RETRY_DELAY_SECONDS", "90"))
 
-# Category controls:
-#   PREFERRED_TAGS   — comma-separated Gamma API tag slugs to fetch first
-#                      (these markets are guaranteed slots regardless of overall volume rank)
-#   EXCLUDED_CATEGORIES — comma-separated category names (as detected by _detect_market_category)
-#                         that are dropped BEFORE scoring. Default: Sports.
-#
-# Gamma tag slugs that work: politics, crypto, economics, science, culture, sports
-_raw_preferred = os.environ.get("PREFERRED_TAGS", "politics,crypto,economics,science,culture")
-_raw_excluded  = os.environ.get("EXCLUDED_CATEGORIES", "")
-PREFERRED_TAGS       = [t.strip() for t in _raw_preferred.split(",") if t.strip()]
-EXCLUDED_CATEGORIES  = {c.strip() for c in _raw_excluded.split(",") if c.strip()}
+BUCKET_THRESHOLDS = {
+    "insider": int(os.environ.get("MIN_INSIDER_CONFIDENCE", str(DEFAULT_BUCKET_THRESHOLDS["insider"]))),
+    "sports_news": int(os.environ.get("MIN_SPORTS_CONFIDENCE", str(DEFAULT_BUCKET_THRESHOLDS["sports_news"]))),
+    "momentum": int(os.environ.get("MIN_MOMENTUM_SCORE", str(DEFAULT_BUCKET_THRESHOLDS["momentum"]))),
+    "contrarian": int(os.environ.get("MIN_CONTRARIAN_SCORE", str(DEFAULT_BUCKET_THRESHOLDS["contrarian"]))),
+}
+
+_raw_preferred = os.environ.get("PREFERRED_TAGS", "politics,crypto,economics,science,culture,sports")
+_raw_excluded = os.environ.get("EXCLUDED_CATEGORIES", "")
+PREFERRED_TAGS = [t.strip() for t in _raw_preferred.split(",") if t.strip()]
+EXCLUDED_CATEGORIES = {c.strip() for c in _raw_excluded.split(",") if c.strip()}
+
+
+def _trade_usdc(trade: dict) -> float:
+    raw = trade.get("usdcSize")
+    if raw not in (None, ""):
+        try:
+            return float(raw)
+        except Exception:
+            pass
+    size = float(trade.get("size") or 0)
+    price = float(trade.get("price") or 0)
+    if size and price:
+        return size * price
+    return size
 
 
 def flag_suspicious_markets(markets: list[dict]) -> list[dict]:
-    now     = datetime.now(timezone.utc)
-    cutoff  = now + timedelta(days=30)   # only keep markets resolving within 30 days
+    now = datetime.now(timezone.utc)
+    cutoff = now + timedelta(days=30)
     flagged = []
 
-    for m in markets:
+    for market in markets:
         try:
-            # ── Resolution date filter ─────────────────────────────────────────
-            end_raw = m.get("endDateIso") or m.get("endDate")
+            end_raw = market.get("endDateIso") or market.get("endDate")
             if not end_raw:
                 continue
             end_dt = datetime.fromisoformat(str(end_raw).replace("Z", "+00:00"))
             if end_dt.tzinfo is None:
                 end_dt = end_dt.replace(tzinfo=timezone.utc)
             if end_dt <= now or end_dt > cutoff:
-                continue   # skip already-resolved or >30 days away
+                continue
 
-            # ── Volume / liquidity flags ───────────────────────────────────────
-            vol_24h   = float(m.get("volume24hr") or 0)
-            vol_total = float(m.get("volume") or 0)
-            liquidity = float(m.get("liquidity") or 0)
-            avg_7d    = vol_total / 7 if vol_total else 0
-            spike     = (vol_24h / avg_7d) if avg_7d > 0 else 0
+            volume_24h = float(market.get("volume24hr") or 0)
+            volume_total = float(market.get("volume") or 0)
+            liquidity = float(market.get("liquidity") or 0)
+            avg_7d = volume_total / 7 if volume_total else 0
+            spike = (volume_24h / avg_7d) if avg_7d > 0 else 0
 
             if (
-                (liquidity < MAX_NICHE_TVL and vol_24h > MIN_BET_USDC)
+                (liquidity < MAX_NICHE_TVL and volume_24h > MIN_BET_USDC)
                 or spike >= VOLUME_SPIKE_FACTOR
-                or vol_24h > MIN_BET_USDC * 5
+                or volume_24h > MIN_BET_USDC * 5
             ):
-                m["_spike_ratio"] = round(spike, 2)
-                m["_is_niche"]    = liquidity < MAX_NICHE_TVL
-                m["_days_to_end"] = round((end_dt - now).total_seconds() / 86400, 1)
-                flagged.append(m)
+                market["_spike_ratio"] = round(spike, 2)
+                market["_is_niche"] = liquidity < MAX_NICHE_TVL
+                market["_days_to_end"] = round((end_dt - now).total_seconds() / 86400, 1)
+                flagged.append(market)
         except Exception:
             continue
     return flagged
 
 
-def group_trades_by_wallet(trades: list[dict]) -> dict[str, list[dict]]:
-    wallet_trades = defaultdict(list)
-    for t in trades:
-        addr = (
-            t.get("proxyWallet") or
-            t.get("maker") or
-            t.get("transactor") or
-            t.get("address") or ""
-        ).lower().strip()
-        if addr.startswith("0x") and len(addr) == 42:
-            wallet_trades[addr].append(t)
-    return wallet_trades
-
-
-# ── Market category detection ─────────────────────────────────────────────────
 SPORTS_KEYWORDS = {
-    "nba", "nfl", "nhl", "mlb", "ncaa", "nfl", "soccer", "tennis",
+    "nba", "nfl", "nhl", "mlb", "ncaa", "soccer", "tennis",
     "football", "basketball", "baseball", "hockey", "golf", "ufc", "mma",
     "esports", "match", "game", "vs.", "vs ", "spread", "o/u", "over/under",
-    "nuggets", "lakers", "celtics", "warriors", "bulls", "heat", "nets",
     "champions league", "premier league", "bundesliga", "serie a", "la liga",
     "world cup", "super bowl", "playoffs", "tournament", "race",
 }
-
 CRYPTO_KEYWORDS = {"bitcoin", "btc", "eth", "ethereum", "crypto", "token", "sol", "price"}
-POLITICS_KEYWORDS = {"election", "president", "senate", "congress", "vote", "trump",
-                     "biden", "resign", "impeach", "policy", "war", "military", "iran",
-                     "israel", "ukraine", "russia", "china", "fed", "interest rate"}
+POLITICS_KEYWORDS = {
+    "election", "president", "senate", "congress", "vote", "trump", "biden",
+    "resign", "impeach", "policy", "war", "military", "iran", "israel",
+    "ukraine", "russia", "china", "fed", "interest rate",
+}
+
+
+def _text_has_keyword(text: str, keyword: str) -> bool:
+    keyword = keyword.lower()
+    if any(ch in keyword for ch in {" ", "/", ".", "-", "+"}):
+        return keyword in text
+    return re.search(rf"(?<![a-z0-9]){re.escape(keyword)}(?![a-z0-9])", text) is not None
+
+
+def _contains_any_keyword(text: str, keywords: set[str]) -> bool:
+    return any(_text_has_keyword(text, keyword) for keyword in keywords)
 
 
 def _detect_market_category(market: dict) -> str:
-    """Classify market into category for display and risk warnings."""
     tags = [t.lower() for t in (market.get("tags") or [])]
     question = (market.get("question") or market.get("title") or "").lower()
     text = question + " " + " ".join(tags)
 
-    # Tags-first: Gamma API includes explicit category tags
     for tag in tags:
-        if tag in ("sports", "nba", "nfl", "nhl", "mlb", "ncaa", "soccer",
-                   "tennis", "esports", "basketball", "football", "baseball",
-                   "hockey", "golf", "ufc"):
+        if tag in {"sports", "nba", "nfl", "nhl", "mlb", "ncaa", "soccer", "tennis", "esports", "basketball", "football", "baseball", "hockey", "golf", "ufc"}:
             return "Sports"
-        if tag in ("crypto", "bitcoin", "ethereum", "defi"):
+        if tag in {"crypto", "bitcoin", "ethereum", "defi"}:
             return "Crypto"
-        if tag in ("politics", "elections", "us-politics", "geopolitics"):
+        if tag in {"politics", "elections", "us-politics", "geopolitics"}:
             return "Politics"
-        if tag in ("finance", "economics", "fed", "rates"):
+        if tag in {"finance", "economics", "fed", "rates"}:
             return "Finance"
 
-    # Fallback: keyword scan on question text
-    if any(kw in text for kw in SPORTS_KEYWORDS):
-        return "Sports"
-    if any(kw in text for kw in CRYPTO_KEYWORDS):
-        return "Crypto"
-    if any(kw in text for kw in POLITICS_KEYWORDS):
+    if _contains_any_keyword(text, POLITICS_KEYWORDS):
         return "Politics"
-
+    if _contains_any_keyword(text, CRYPTO_KEYWORDS):
+        return "Crypto"
+    if _contains_any_keyword(text, SPORTS_KEYWORDS):
+        return "Sports"
     return "Other"
 
 
+def _annotate_trade(trade: dict, market: dict) -> dict:
+    row = dict(trade)
+    row["_market_name"] = market.get("question") or market.get("title") or market.get("conditionId")
+    row["_market_address"] = market.get("conditionId") or market.get("condition_id")
+    row["_market_liquidity"] = float(market.get("liquidity") or 0)
+    row["_market_end"] = market.get("endDateIso") or market.get("endDate")
+    row["_spike_ratio"] = market.get("_spike_ratio", 0)
+    row["_market_category"] = market.get("_detected_category") or _detect_market_category(market)
+    row["usdcSize"] = _trade_usdc(row)
+    return row
+
+
+def _build_alert_candidates(market_trade_cache: dict[str, list[dict]]) -> tuple[dict[tuple[str, str], list[dict]], dict[str, float], int]:
+    grouped = {}
+    wallet_rank = defaultdict(float)
+    large_trade_count = 0
+
+    for market_id, trades in market_trade_cache.items():
+        by_wallet = defaultdict(list)
+        for trade in trades:
+            addr = wallet_from_trade(trade)
+            if not addr.startswith("0x") or len(addr) != 42:
+                continue
+            by_wallet[(addr, market_id)].append(trade)
+            if _trade_usdc(trade) >= MIN_BET_USDC:
+                large_trade_count += 1
+
+        for key, wallet_trades in by_wallet.items():
+            buy_usdc = sum(
+                _trade_usdc(trade)
+                for trade in wallet_trades
+                if (trade.get("side") or "BUY").upper() == "BUY"
+            )
+            largest_buy = max(
+                (
+                    _trade_usdc(trade)
+                    for trade in wallet_trades
+                    if (trade.get("side") or "BUY").upper() == "BUY"
+                ),
+                default=0,
+            )
+            if buy_usdc < MIN_BET_USDC and largest_buy < MIN_BET_USDC:
+                continue
+            grouped[key] = sorted(wallet_trades, key=lambda item: trade_time(item) or datetime.min.replace(tzinfo=timezone.utc))
+            wallet_rank[key[0]] += max(buy_usdc, largest_buy)
+
+    return grouped, wallet_rank, large_trade_count
+
+
+def _detect_swarm_clusters(alert_candidates: dict[tuple[str, str], list[dict]]) -> dict[tuple[str, str], int]:
+    market_entries = defaultdict(list)
+    for (wallet, market_id), trades in alert_candidates.items():
+        first_dt = next((trade_time(trade) for trade in trades if trade_time(trade)), None)
+        if first_dt:
+            market_entries[market_id].append((wallet, first_dt))
+
+    swarm_sizes = {}
+    for market_id, entries in market_entries.items():
+        entries.sort(key=lambda item: item[1])
+        for idx, (start_wallet, start_dt) in enumerate(entries):
+            cluster = {start_wallet}
+            for wallet, dt in entries[idx + 1:]:
+                hours = (dt - start_dt).total_seconds() / 3600
+                if hours > SWARM_HOURS:
+                    break
+                cluster.add(wallet)
+            if len(cluster) >= SWARM_MIN_WALLETS:
+                for wallet in cluster:
+                    swarm_sizes[(wallet, market_id)] = max(swarm_sizes.get((wallet, market_id), 0), len(cluster))
+    return swarm_sizes
+
+
+def _market_payload(market: dict) -> dict:
+    return {
+        "market_id": market.get("conditionId") or market.get("condition_id"),
+        "market_name": market.get("question") or market.get("title") or "",
+        "market_end": market.get("endDateIso") or market.get("endDate"),
+        "market_liquidity": float(market.get("liquidity") or 0),
+        "category": market.get("_detected_category") or _detect_market_category(market),
+        "spike_ratio": float(market.get("_spike_ratio") or 0),
+    }
+
+
+def _fetch_market_universe() -> list[dict]:
+    targeted_markets = fetch_markets_by_tags(PREFERRED_TAGS, per_tag_limit=50) if PREFERRED_TAGS else []
+    targeted_ids = {m.get("conditionId") or m.get("condition_id") or m.get("id") for m in targeted_markets}
+
+    top_volume_markets = fetch_active_markets(limit=200)
+    for market in top_volume_markets:
+        market_id = market.get("conditionId") or market.get("condition_id") or market.get("id")
+        if market_id and market_id not in targeted_ids:
+            targeted_markets.append(market)
+            targeted_ids.add(market_id)
+
+    for market in targeted_markets:
+        market["_detected_category"] = _detect_market_category(market)
+    return targeted_markets
+
+
+def _apply_market_filters(markets: list[dict]) -> list[dict]:
+    pre_filter_count = len(markets)
+    if EXCLUDED_CATEGORIES:
+        markets = [market for market in markets if market["_detected_category"] not in EXCLUDED_CATEGORIES]
+        log.info(f"  → Dropped {pre_filter_count - len(markets)} excluded markets")
+    return markets
+
+
+def _build_output_payload(
+    generated_at: str,
+    stats: dict,
+    candidate_pool: list[dict],
+    watchlist: list[dict],
+    review_summary: dict,
+    run_health: dict | None = None,
+) -> dict:
+    return {
+        "generated_at": generated_at,
+        "stats": stats,
+        "run_health": run_health or {"status": "healthy", "reason": None, "request_health": get_request_health()},
+        "bucket_thresholds": BUCKET_THRESHOLDS,
+        "candidate_pool": candidate_pool,
+        "watchlist": watchlist,
+        "review_summary": review_summary,
+        "review_log_path": DEFAULT_REVIEW_LOG_PATH,
+        "tuning_summary_path": TUNING_SUMMARY_PATH,
+        "tuning_checklist_path": TUNING_CHECKLIST_PATH,
+        "html_report_path": "report.html",
+    }
+
+
+def _write_output(payload: dict) -> None:
+    output_path = "watchlist.json"
+    with open(output_path, "w") as handle:
+        json.dump(payload, handle, indent=2)
+    log.info(f"  → Saved to {output_path}")
+
+
+def _current_run_health(status: str = "healthy", reason: str | None = None) -> dict:
+    return {
+        "status": status,
+        "reason": reason,
+        "request_health": get_request_health(),
+    }
+
+
+def _finalize_empty_run(
+    *,
+    run_started_at: str,
+    stats: dict,
+    review_entries: list[dict],
+    arb_alerts: list[dict] | None = None,
+    unhealthy_reason: str | None = None,
+) -> None:
+    arb_alerts = arb_alerts or []
+    payload = _build_output_payload(
+        generated_at=run_started_at,
+        stats=stats,
+        candidate_pool=[],
+        watchlist=[],
+        review_summary=summarize_review_log(review_entries),
+        run_health=_current_run_health(
+            status="unhealthy" if unhealthy_reason else "healthy",
+            reason=unhealthy_reason,
+        ),
+    )
+    _write_output(payload)
+    write_tuning_artifacts(payload, review_entries)
+    write_html_report([], stats, arb_alerts=arb_alerts, run_health=payload["run_health"])
+    email_ok = send_email([], stats, arb_alerts=arb_alerts, run_health=payload["run_health"])
+    send_telegram_alerts([], stats, arb_alerts=arb_alerts)
+    if unhealthy_reason:
+        log.error(f"Run marked unhealthy: {unhealthy_reason}")
+        sys.exit(1)
+    if not email_ok:
+        log.error("Empty-report delivery failed")
+        sys.exit(1)
+
+
 def run():
+    run_started_at = datetime.now(timezone.utc).isoformat()
+    reset_request_health()
     log.info("═══════════════════════════════════════════════════════")
-    log.info("  Polymarket Insider Tracker — starting daily scan")
+    log.info("  Polymarket Strategy Tracker — starting scan")
     log.info("═══════════════════════════════════════════════════════")
-    log.info(f"  Threshold : {MIN_SUSPICION_SCORE} pts")
+    log.info(f"  Candidate threshold : {MIN_CANDIDATE_SCORE} pts")
+    log.info(f"  Bucket thresholds   : {BUCKET_THRESHOLDS}")
     log.info(f"  Max wallets to score: {MAX_WALLETS_TO_SCORE}")
 
     stats = {
         "markets_scanned": 0,
+        "flagged_markets": 0,
         "large_trades": 0,
         "wallets_evaluated": 0,
+        "alerts_scored": 0,
+        "candidate_alerts": 0,
+        "flagged_alerts": 0,
+        "candidate_wallets": 0,
         "flagged_wallets": 0,
+        "insider_watchlist": 0,
+        "sports_watchlist": 0,
+        "momentum_watchlist": 0,
+        "contrarian_watchlist": 0,
         "data_sources_active": 0,
+        "arb_opportunities": 0,
+        "bucket_watchlist_counts": {
+            "insider": 0,
+            "sports_news": 0,
+            "momentum": 0,
+            "contrarian": 0,
+        },
     }
 
-    # ── Step 1: Fetch markets ──────────────────────────────────────────────────
     log.info("\n[1/7] Fetching active Polymarket markets…")
-    log.info(f"  Preferred tags  : {PREFERRED_TAGS}")
-    log.info(f"  Excluded cats   : {EXCLUDED_CATEGORIES}")
+    log.info(f"  Preferred tags : {PREFERRED_TAGS}")
+    log.info(f"  Excluded cats  : {EXCLUDED_CATEGORIES}")
 
-    # Phase 1a — targeted fetch for preferred categories (guaranteed slots)
-    targeted_markets = fetch_markets_by_tags(PREFERRED_TAGS, per_tag_limit=50) if PREFERRED_TAGS else []
-    targeted_ids     = {m.get("conditionId") or m.get("condition_id") or m.get("id") for m in targeted_markets}
+    markets = []
+    for attempt in range(BOOTSTRAP_RETRY_COUNT + 1):
+        if attempt:
+            log.warning(
+                f"  → Retrying market bootstrap in {BOOTSTRAP_RETRY_DELAY_SECONDS}s "
+                f"(attempt {attempt + 1}/{BOOTSTRAP_RETRY_COUNT + 1})"
+            )
+            time.sleep(BOOTSTRAP_RETRY_DELAY_SECONDS)
+        markets = _apply_market_filters(_fetch_market_universe())
+        stats["markets_scanned"] = len(markets)
+        log.info(f"  → {len(markets)} total unique markets fetched")
 
-    # Phase 1b — top-200 by volume (fills in anything targeted fetch missed)
-    top_volume_markets = fetch_active_markets(limit=200)
-    for m in top_volume_markets:
-        mid = m.get("conditionId") or m.get("condition_id") or m.get("id")
-        if mid and mid not in targeted_ids:
-            targeted_markets.append(m)
-            targeted_ids.add(mid)
-
-    markets = targeted_markets
-    stats["markets_scanned"] = len(markets)
-    log.info(f"  → {len(markets)} total unique markets fetched")
-
-    # Phase 1c — detect categories then drop excluded ones
-    for m in markets:
-        m["_detected_category"] = _detect_market_category(m)
-
-    pre_filter = len(markets)
-    if EXCLUDED_CATEGORIES:
-        markets = [m for m in markets if m["_detected_category"] not in EXCLUDED_CATEGORIES]
-        dropped = pre_filter - len(markets)
-        log.info(f"  → Dropped {dropped} {EXCLUDED_CATEGORIES} markets — {len(markets)} remain")
-
-    flagged_markets = flag_suspicious_markets(markets)
-    log.info(f"  → {len(flagged_markets)} markets flagged for deep scan")
-
-    if not flagged_markets:
-        log.warning("No suspicious markets today. Sending empty report.")
-        send_email([], stats, contrarian_alerts=[])
-        return
-
-    stats["data_sources_active"] += 1  # Polymarket is up
-
-    # ── Step 2: Pull Dune supplementary data ──────────────────────────────────
-    log.info("\n[2/7] Querying Dune Analytics…")
-    dune_whale_list      = fetch_dune_whale_wallets()
-    dune_new_wallet_list = fetch_dune_new_large_bettors()
-
-    if dune_whale_list or dune_new_wallet_list:
-        stats["data_sources_active"] += 1
-        log.info(f"  → {len(dune_whale_list)} whale wallets, {len(dune_new_wallet_list)} new large bettors from Dune")
-    else:
-        log.warning("  → Dune returned no data (check API key / query IDs)")
-
-    # ── Step 3: Extract large trades from flagged markets ─────────────────────
-    log.info("\n[3/7] Extracting large trades from flagged markets…")
-    all_trades = []
-    for m in flagged_markets:
-        cid = m.get("conditionId") or m.get("condition_id")
-        if not cid:
-            continue
-        trades = fetch_market_trades(cid)
-        for t in trades:
-            # data-api returns size=shares, price=per share → USDC = size * price
-            size  = float(t.get("size") or 0)
-            price = float(t.get("price") or 0)
-            usdc  = size * price
-            if usdc >= MIN_BET_USDC:
-                t["_market_name"]      = m.get("question") or m.get("title") or cid
-                t["_market_address"]   = cid
-                t["_market_liquidity"] = float(m.get("liquidity") or 0)
-                t["_market_end"]       = m.get("endDateIso") or m.get("endDate")
-                t["_spike_ratio"]      = m.get("_spike_ratio", 0)
-                t["_market_category"]  = m.get("_detected_category") or _detect_market_category(m)
-                t["usdcSize"]          = usdc
-                all_trades.append(t)
-
-    stats["large_trades"] = len(all_trades)
-    log.info(f"  → {len(all_trades)} large trades found")
-
-    # ── Step 3c: Contrarian opportunity detection (Module C) ──────────────────
-    # Detect "dumb money" price manipulation: price spiked >30% in <1hr with no
-    # fundamental news → the opposite side becomes high +EV
-    contrarian_alerts = []
-    market_price_windows: dict = {}
-    for t in all_trades:
-        mkt   = t.get("_market_address", "")
-        price = float(t.get("price") or 0)
-        ts    = t.get("timestamp") or t.get("createdAt")
-        if not (mkt and price and ts):
-            continue
-        dt = None
-        try:
-            dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-        except Exception:
-            continue
-        market_price_windows.setdefault(mkt, []).append((dt, price))
-
-    for mkt, entries in market_price_windows.items():
-        if len(entries) < 2:
-            continue
-        entries.sort(key=lambda x: x[0])
-        # Scan 1-hour rolling windows for >30% price spike
-        for i, (dt_start, p_start) in enumerate(entries):
-            for dt_end, p_end in entries[i+1:]:
-                window_hrs = (dt_end - dt_start).total_seconds() / 3600
-                if window_hrs > 1.0:
-                    break
-                if p_start > 0 and abs(p_end - p_start) / p_start >= 0.30:
-                    direction  = "UP" if p_end > p_start else "DOWN"
-                    opp_side   = "BUY NO" if direction == "UP" else "BUY YES"
-                    mkt_name   = next(
-                        (t.get("_market_name") for t in all_trades if t.get("_market_address") == mkt),
-                        mkt[:20]
-                    )
-                    contrarian_alerts.append({
-                        "market":       mkt_name,
-                        "market_id":    mkt,
-                        "price_from":   round(p_start, 3),
-                        "price_to":     round(p_end, 3),
-                        "spike_pct":    round(abs(p_end - p_start) / p_start * 100, 1),
-                        "direction":    direction,
-                        "opportunity":  opp_side,
-                        "window_mins":  round(window_hrs * 60, 0),
-                    })
-                    break  # one alert per market
-
-    if contrarian_alerts:
-        log.info(f"  → {len(contrarian_alerts)} contrarian opportunities detected")
-
-    # ── Step 3b: Coordinated swarm detection ─────────────────────────
-    # Multiple new wallets entering same market within ±2h = coordinated swarm
-    SWARM_HOURS = 2
-    SWARM_MIN   = 3
-    market_wallet_times = defaultdict(list)
-    for t in all_trades:
-        mkt  = t.get("_market_address", "")
-        addr = (t.get("proxyWallet") or t.get("maker") or "").lower()
-        ts   = t.get("timestamp") or t.get("createdAt")
-        if mkt and addr and ts:
-            try:
-                dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                market_wallet_times[mkt].append((addr, dt))
-            except Exception:
-                pass
-
-    swarm_wallets = set()
-    for mkt, entries in market_wallet_times.items():
-        entries.sort(key=lambda x: x[1])
-        for i, (addr_i, dt_i) in enumerate(entries):
-            cluster = [addr_i]
-            for addr_j, dt_j in entries[i+1:]:
-                if (dt_j - dt_i).total_seconds() / 3600 <= SWARM_HOURS:
-                    if addr_j != addr_i:
-                        cluster.append(addr_j)
-                else:
-                    break
-            if len(set(cluster)) >= SWARM_MIN:
-                for w in cluster:
-                    swarm_wallets.add(w)
-
-    if swarm_wallets:
-        log.info(f"  → Coordinated swarm: {len(swarm_wallets)} wallets flagged")
-
-    # ── Step 4: Group by wallet + merge Dune seed wallets ─────────────────────
-    log.info("\n[4/7] Grouping trades by wallet…")
-    wallet_trades = group_trades_by_wallet(all_trades)
-
-    # Seed in Dune-flagged wallets even if they don't appear in trade scan
-    for w in (dune_whale_list + dune_new_wallet_list):
-        if w and w.lower() not in wallet_trades:
-            wallet_trades[w.lower()] = []
-
-    # Sort by trade count + size for prioritisation
-    sorted_wallets = sorted(
-        wallet_trades.items(),
-        key=lambda x: (len(x[1]), sum(float(t.get("usdcSize") or t.get("size") or 0) for t in x[1])),
-        reverse=True,
-    )[:MAX_WALLETS_TO_SCORE]
-
-    stats["wallets_evaluated"] = len(sorted_wallets)
-    log.info(f"  → {len(sorted_wallets)} unique wallets to evaluate")
-
-    # ── Step 5: Enrich each wallet ─────────────────────────────────────────────
-    log.info("\n[5/7] Enriching wallets (Polymarket history + Polygonscan + Arkham)…")
-    watchlist = []
-    poly_active = False
-    arkham_active = False
-
-    for i, (addr, trades) in enumerate(sorted_wallets, 1):
-        log.info(f"  [{i}/{len(sorted_wallets)}] {addr[:10]}… ({len(trades)} trades)")
-
-        activity  = fetch_wallet_activity(addr)
-        positions = fetch_wallet_positions(addr)
-        if activity or positions:
-            poly_active = True
-
-        polygon   = fetch_polygon_tx_history(addr)
-        arkham    = fetch_arkham_entity(addr)
-        if arkham.get("label") and arkham.get("label") != "Unknown":
-            arkham_active = True
-
-        record = score_wallet(
-            address              = addr,
-            recent_trades        = trades,
-            polymarket_activity  = activity,
-            positions            = positions,
-            polygon_data         = polygon,
-            arkham_data          = arkham,
-            dune_whale_list      = dune_whale_list,
-            dune_new_wallet_list = dune_new_wallet_list,
-            is_swarm_wallet      = addr in swarm_wallets,
+        request_health = get_request_health()
+        if markets or request_health["failed_calls"] == 0 or attempt >= BOOTSTRAP_RETRY_COUNT:
+            break
+        log.warning(
+            "  → Market bootstrap returned 0 markets after upstream request failures; "
+            "waiting before retrying once."
         )
 
-        if record["suspicion_score"] >= MIN_SUSPICION_SCORE:
-            watchlist.append(record)
-            log.info(f"    ✅ Score {record['suspicion_score']} → ADDED to watchlist")
-        else:
-            log.info(f"    ➖ Score {record['suspicion_score']} → below threshold")
+    request_health = get_request_health()
+    if not markets and request_health["failed_calls"] > 0:
+        log.error("Market bootstrap failed due to upstream request errors; writing unhealthy empty run.")
+        review_entries = load_review_log(DEFAULT_REVIEW_LOG_PATH)
+        _finalize_empty_run(
+            run_started_at=run_started_at,
+            stats=stats,
+            review_entries=review_entries,
+            unhealthy_reason=f"market_bootstrap_failed: {request_health.get('last_error') or 'unknown request error'}",
+        )
+        return
+
+    log.info("\n[1b/7] Scanning CLOB for arbitrage opportunities…")
+    arb_alerts = batch_scan_arb(markets, limit=80)
+    stats["arb_opportunities"] = len(arb_alerts)
+    if arb_alerts:
+        log.info(f"  → {len(arb_alerts)} arb opportunities found")
+    else:
+        log.info("  → No arb gaps detected")
+
+    flagged_markets = flag_suspicious_markets(markets)
+    stats["flagged_markets"] = len(flagged_markets)
+    log.info(f"  → {len(flagged_markets)} markets flagged for deep scan")
+
+    if not flagged_markets and not arb_alerts:
+        log.warning("No watchlist candidates or arb opportunities today. Sending empty report.")
+        review_entries = load_review_log(DEFAULT_REVIEW_LOG_PATH)
+        _finalize_empty_run(
+            run_started_at=run_started_at,
+            stats=stats,
+            review_entries=review_entries,
+            arb_alerts=[],
+        )
+        return
+
+    stats["data_sources_active"] += 1
+
+    log.info("\n[2/7] Querying Dune Analytics…")
+    dune_whale_list = fetch_dune_whale_wallets()
+    dune_new_wallet_list = fetch_dune_new_large_bettors()
+    if dune_whale_list or dune_new_wallet_list:
+        stats["data_sources_active"] += 1
+        log.info(f"  → {len(dune_whale_list)} whale wallets, {len(dune_new_wallet_list)} new large bettors")
+    else:
+        log.warning("  → Dune returned no data")
+
+    log.info("\n[3/7] Fetching market trades for flagged markets…")
+    market_lookup = {}
+    market_trade_cache = {}
+    for market in flagged_markets:
+        market_id = market.get("conditionId") or market.get("condition_id")
+        if not market_id:
+            continue
+        market_lookup[market_id] = _market_payload(market)
+        trades = fetch_market_trades(market_id, limit=MARKET_TRADE_LIMIT)
+        market_trade_cache[market_id] = [_annotate_trade(trade, market) for trade in trades]
+
+    alert_candidates, wallet_rank, large_trade_count = _build_alert_candidates(market_trade_cache)
+    swarm_sizes = _detect_swarm_clusters(alert_candidates)
+    stats["large_trades"] = large_trade_count
+    log.info(f"  → {large_trade_count} large trades and {len(alert_candidates)} wallet+market alert candidates")
+
+    request_health = get_request_health()
+    trade_fetch_failed = (
+        stats["flagged_markets"] > 0
+        and request_health["failed_calls"] > 0
+        and all(not trades for trades in market_trade_cache.values())
+    )
+    if trade_fetch_failed and not arb_alerts:
+        log.error("Flagged market deep scan failed due to upstream request errors; writing unhealthy empty run.")
+        review_entries = load_review_log(DEFAULT_REVIEW_LOG_PATH)
+        _finalize_empty_run(
+            run_started_at=run_started_at,
+            stats=stats,
+            review_entries=review_entries,
+            arb_alerts=[],
+            unhealthy_reason=f"market_trade_fetch_failed: {request_health.get('last_error') or 'unknown request error'}",
+        )
+        return
+
+    if not alert_candidates and not arb_alerts:
+        log.warning("No wallet+market candidates today. Sending report with arb only if available.")
+        review_entries = load_review_log(DEFAULT_REVIEW_LOG_PATH)
+        _finalize_empty_run(
+            run_started_at=run_started_at,
+            stats=stats,
+            review_entries=review_entries,
+            arb_alerts=arb_alerts,
+        )
+        return
+
+    ranked_wallets = sorted(
+        wallet_rank,
+        key=lambda wallet: wallet_rank[wallet],
+        reverse=True,
+    )[:MAX_WALLETS_TO_SCORE]
+    selected_wallets = set(ranked_wallets)
+    stats["wallets_evaluated"] = len(selected_wallets)
+    log.info(f"  → {len(selected_wallets)} wallets selected for enrichment")
+
+    log.info("\n[4/7] Enriching selected wallets…")
+    wallet_context = {}
+    poly_active = False
+    arkham_active = False
+    for idx, wallet in enumerate(ranked_wallets, 1):
+        log.info(f"  [{idx}/{len(ranked_wallets)}] {wallet[:10]}…")
+        activity = fetch_wallet_activity(wallet)
+        positions = fetch_wallet_positions(wallet)
+        polygon = fetch_polygon_tx_history(wallet)
+        arkham = fetch_arkham_entity(wallet)
+        wallet_context[wallet] = {
+            "activity": activity,
+            "positions": positions,
+            "polygon": polygon,
+            "arkham": arkham,
+        }
+        if activity or positions:
+            poly_active = True
+        if arkham.get("label") and arkham.get("label") != "Unknown":
+            arkham_active = True
 
     if poly_active:
         stats["data_sources_active"] += 1
     if arkham_active:
         stats["data_sources_active"] += 1
 
+    log.info("\n[5/7] Scoring wallet+market alerts across four buckets…")
+    candidate_pool = []
+    watchlist = []
+    candidate_wallets = set()
+
+    scored_keys = sorted(
+        [key for key in alert_candidates if key[0] in selected_wallets],
+        key=lambda key: (
+            -sum(_trade_usdc(trade) for trade in alert_candidates[key]),
+            key[0],
+            key[1],
+        ),
+    )
+
+    for wallet, market_id in scored_keys:
+        context = wallet_context[wallet]
+        record = score_alert(
+            address=wallet,
+            market=market_lookup[market_id],
+            alert_trades=alert_candidates[(wallet, market_id)],
+            market_trades=market_trade_cache.get(market_id, []),
+            polymarket_activity=context["activity"],
+            positions=context["positions"],
+            polygon_data=context["polygon"],
+            arkham_data=context["arkham"],
+            dune_whale_list=dune_whale_list,
+            dune_new_wallet_list=dune_new_wallet_list,
+            swarm_cluster_size=swarm_sizes.get((wallet, market_id), 0),
+            min_candidate_score=MIN_CANDIDATE_SCORE,
+            bucket_thresholds=BUCKET_THRESHOLDS,
+        )
+        record["generated_at"] = run_started_at
+        record["run_id"] = run_started_at
+        candidate_pool.append(record)
+        if record["is_candidate"]:
+            candidate_wallets.add(wallet)
+        if record["passes_strategy_threshold"]:
+            watchlist.append(record)
+            stats["bucket_watchlist_counts"][record["best_bucket"]] += 1
+            if record["best_bucket"] == "insider":
+                stats["insider_watchlist"] += 1
+            elif record["best_bucket"] == "sports_news":
+                stats["sports_watchlist"] += 1
+            elif record["best_bucket"] == "momentum":
+                stats["momentum_watchlist"] += 1
+            elif record["best_bucket"] == "contrarian":
+                stats["contrarian_watchlist"] += 1
+
+    stats["alerts_scored"] = len(candidate_pool)
+    stats["candidate_alerts"] = sum(1 for alert in candidate_pool if alert["is_candidate"])
+    stats["flagged_alerts"] = len(watchlist)
+    stats["candidate_wallets"] = len(candidate_wallets)
     stats["flagged_wallets"] = len(watchlist)
-    log.info(f"\n[6/7] {len(watchlist)} wallets added to watchlist")
 
-    # ── Step 6: Save JSON output ───────────────────────────────────────────────
-    output_path = "watchlist.json"
-    with open(output_path, "w") as f:
-        json.dump({
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-            "stats": stats,
-            "watchlist": sorted(watchlist, key=lambda x: -x["suspicion_score"]),
-        }, f, indent=2)
-    log.info(f"  → Saved to {output_path}")
+    log.info(
+        f"  → {stats['candidate_alerts']} stage-1 candidates · "
+        f"{stats['flagged_alerts']} watchlist alerts"
+    )
 
-    # ── Step 7: Send email ─────────────────────────────────────────────────────
-    log.info("\n[7/7] Sending email report…")
-    ok = send_email(watchlist, stats, contrarian_alerts=contrarian_alerts)
+    log.info("\n[6/7] Updating durable review log…")
+    review_entries, review_summary = sync_review_log(
+        alerts=watchlist,
+        market_trade_cache=market_trade_cache,
+        fetch_market_trades=fetch_market_trades,
+        path=DEFAULT_REVIEW_LOG_PATH,
+    )
+    review_map = {entry["alert_id"]: entry for entry in review_entries}
+    for alert in candidate_pool:
+        if alert["alert_id"] in review_map:
+            alert["review_status"] = review_map[alert["alert_id"]]["review_status"]
+    for alert in watchlist:
+        if alert["alert_id"] in review_map:
+            alert["review_status"] = review_map[alert["alert_id"]]["review_status"]
+
+    candidate_pool.sort(key=lambda alert: (-alert["best_score"], -alert["candidate_score"]))
+    watchlist.sort(key=lambda alert: (-alert["best_score"], -alert["candidate_score"]))
+
+    payload = _build_output_payload(
+        generated_at=run_started_at,
+        stats=stats,
+        candidate_pool=candidate_pool,
+        watchlist=watchlist,
+        review_summary=review_summary,
+        run_health=_current_run_health(),
+    )
+    _write_output(payload)
+    write_tuning_artifacts(payload, review_entries)
+    write_html_report(watchlist, stats, arb_alerts=arb_alerts, run_health=payload["run_health"])
+
+    log.info("\n[7/7] Sending reports…")
+    ok = send_email(watchlist, stats, arb_alerts=arb_alerts, run_health=payload["run_health"])
     if ok:
         log.info("  → Email delivered successfully")
     else:
         log.error("  → Email failed")
         sys.exit(1)
 
+    tg_ok = send_telegram_alerts(watchlist, stats, arb_alerts=arb_alerts)
+    if tg_ok:
+        log.info("  → Telegram alerts sent")
+    else:
+        log.warning("  → Telegram skipped")
+
     log.info("\n═══════════════════════════════════════════════════════")
-    log.info(f"  Done. {stats['flagged_wallets']} wallets flagged.")
+    log.info(
+        f"  Done. {stats['candidate_alerts']} candidates · {stats['flagged_alerts']} watchlist · "
+        f"{stats['insider_watchlist']} insider · {stats['sports_watchlist']} sports/news · "
+        f"{stats['momentum_watchlist']} momentum · {stats['contrarian_watchlist']} contrarian."
+    )
     log.info("═══════════════════════════════════════════════════════")
 
 

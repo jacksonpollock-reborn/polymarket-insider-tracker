@@ -16,8 +16,16 @@ SESSION.headers.update({
     "User-Agent": "polymarket-insider-tracker/1.0",
 })
 
+REQUEST_HEALTH = {
+    "successful_calls": 0,
+    "attempt_failures": 0,
+    "failed_calls": 0,
+    "last_error": None,
+}
+
 GAMMA_API   = "https://gamma-api.polymarket.com"
 DATA_API    = "https://data-api.polymarket.com"
+CLOB_API    = "https://clob.polymarket.com"
 POLYGONSCAN = "https://api.polygonscan.com/api"
 ARKHAM_API  = "https://api.arkhamintelligence.com"
 
@@ -31,15 +39,48 @@ KNOWN_MIXER_PREFIXES = {
 }
 
 
+def reset_request_health():
+    REQUEST_HEALTH.update({
+        "successful_calls": 0,
+        "attempt_failures": 0,
+        "failed_calls": 0,
+        "last_error": None,
+    })
+
+
+def get_request_health():
+    return dict(REQUEST_HEALTH)
+
+
 def _get(url, params=None, headers=None, retries=3):
     for attempt in range(retries):
         try:
             r = SESSION.get(url, params=params, headers=headers, timeout=20)
             r.raise_for_status()
+            REQUEST_HEALTH["successful_calls"] += 1
             return r.json()
         except Exception as e:
+            REQUEST_HEALTH["attempt_failures"] += 1
+            REQUEST_HEALTH["last_error"] = str(e)
             log.warning(f"GET {url} attempt {attempt+1} failed: {e}")
             time.sleep(2 ** attempt)
+    REQUEST_HEALTH["failed_calls"] += 1
+    return None
+
+
+def _post(url, json=None, headers=None, retries=3):
+    for attempt in range(retries):
+        try:
+            r = SESSION.post(url, json=json, headers=headers, timeout=20)
+            r.raise_for_status()
+            REQUEST_HEALTH["successful_calls"] += 1
+            return r.json()
+        except Exception as e:
+            REQUEST_HEALTH["attempt_failures"] += 1
+            REQUEST_HEALTH["last_error"] = str(e)
+            log.warning(f"POST {url} attempt {attempt+1} failed: {e}")
+            time.sleep(2 ** attempt)
+    REQUEST_HEALTH["failed_calls"] += 1
     return None
 
 
@@ -163,17 +204,16 @@ def _dune_execute_and_fetch(query_id: str) -> list[dict]:
     headers = {"X-Dune-API-Key": DUNE_KEY}
 
     # Trigger execution
-    exec_resp = SESSION.post(
+    exec_resp = _post(
         f"{DUNE_API}/query/{query_id}/execute",
         json={"performance": "medium"},
         headers=headers,
-        timeout=20,
     )
-    if exec_resp.status_code != 200:
-        log.warning(f"[Dune] Execute query {query_id} failed: {exec_resp.status_code} {exec_resp.text[:150]}")
+    if not exec_resp:
+        log.warning(f"[Dune] Execute query {query_id} failed before execution_id was returned")
         return []
 
-    execution_id = exec_resp.json().get("execution_id")
+    execution_id = exec_resp.get("execution_id")
     if not execution_id:
         return []
 
@@ -274,3 +314,116 @@ def fetch_arkham_entity(address):
             c.get("address") for c in data.get("cluster", [])[:5] if c.get("address")
         ],
     }
+
+
+# ── Arbitrage Scanner ──────────────────────────────────────────────────────────
+# Polymarket CLOB: YES ask + NO ask < 1.0 → guaranteed profit at resolution.
+# We use 0.97 as threshold (3¢ cushion for Polymarket's 2% fee + gas slippage).
+ARB_THRESHOLD = 0.97
+
+def fetch_clob_book(token_id: str) -> dict:
+    """
+    Fetch the live order book for a single token from Polymarket's CLOB.
+    Returns dict with 'bids' and 'asks' lists, each item {"price": str, "size": str}.
+    Asks are sorted ascending (best ask = asks[0]).
+    """
+    result = _get(f"{CLOB_API}/book", params={"token_id": token_id})
+    time.sleep(0.12)   # 8 req/s safe rate
+    return result or {}
+
+
+def scan_market_for_arb(market: dict) -> dict | None:
+    """
+    Check a single market for direct arbitrage.
+
+    Fetches live best-ask prices for YES and NO tokens from the CLOB.
+    If best_ask_yes + best_ask_no < ARB_THRESHOLD (0.97), a risk-free
+    profit exists: buy both sides for < $0.97, collect $1.00 at resolution.
+
+    Returns an arb dict on opportunity, None otherwise.
+    """
+    tokens = market.get("tokens") or []
+    if len(tokens) < 2:
+        return None
+
+    yes_token = next((t for t in tokens if str(t.get("outcome", "")).upper() == "YES"), None)
+    no_token  = next((t for t in tokens if str(t.get("outcome", "")).upper() == "NO"),  None)
+
+    if not yes_token or not no_token:
+        return None
+
+    yes_id = yes_token.get("token_id") or yes_token.get("tokenId")
+    no_id  = no_token.get("token_id")  or no_token.get("tokenId")
+    if not yes_id or not no_id:
+        return None
+
+    yes_book = fetch_clob_book(yes_id)
+    no_book  = fetch_clob_book(no_id)
+
+    yes_asks = yes_book.get("asks", [])
+    no_asks  = no_book.get("asks",  [])
+    if not yes_asks or not no_asks:
+        return None
+
+    try:
+        yes_ask  = float(yes_asks[0]["price"])
+        no_ask   = float(no_asks[0]["price"])
+        yes_size = float(yes_asks[0].get("size", 0))
+        no_size  = float(no_asks[0].get("size",  0))
+    except (KeyError, ValueError, TypeError):
+        return None
+
+    combined = yes_ask + no_ask
+    if combined >= ARB_THRESHOLD:
+        return None
+
+    # Max fillable at the best ask levels (limited by smaller side)
+    max_fill_shares = min(yes_size, no_size)
+    gross_profit_per_share = 1.0 - combined
+    # After Polymarket 2% fee on winning side (the $1.00 payout)
+    net_profit_per_share = gross_profit_per_share - 0.02
+    max_profit_usdc = round(net_profit_per_share * max_fill_shares, 2)
+
+    return {
+        "market":            market.get("question") or market.get("title", ""),
+        "market_id":         market.get("conditionId") or market.get("condition_id"),
+        "yes_ask":           round(yes_ask, 4),
+        "no_ask":            round(no_ask, 4),
+        "combined":          round(combined, 4),
+        "arb_pct":           round((1.0 - combined) * 100, 2),     # gross %
+        "net_arb_pct":       round(net_profit_per_share * 100, 2), # after fee
+        "max_fill_shares":   round(max_fill_shares, 0),
+        "max_profit_usdc":   max_profit_usdc,
+        "yes_token_id":      yes_id,
+        "no_token_id":       no_id,
+        "liquidity":         float(market.get("liquidity") or 0),
+        "category":          market.get("_detected_category", "Other"),
+        "days_to_end":       market.get("_days_to_end", 0),
+    }
+
+
+def batch_scan_arb(markets: list[dict], limit: int = 80) -> list[dict]:
+    """
+    Scan up to `limit` markets (sorted by 24h volume) for arb opportunities.
+    Returns list of arb dicts sorted by net_arb_pct descending.
+    """
+    candidates = sorted(
+        markets,
+        key=lambda m: float(m.get("volume24hr") or 0),
+        reverse=True,
+    )[:limit]
+
+    found = []
+    for m in candidates:
+        arb = scan_market_for_arb(m)
+        if arb:
+            found.append(arb)
+            log.info(
+                f"[ARB] {arb['market'][:55]} | "
+                f"combined={arb['combined']} | +{arb['net_arb_pct']}% net | "
+                f"max ~${arb['max_profit_usdc']:,.0f}"
+            )
+
+    found.sort(key=lambda a: a["net_arb_pct"], reverse=True)
+    log.info(f"[ARB] Scanned {len(candidates)} markets → {len(found)} arb opportunities found")
+    return found

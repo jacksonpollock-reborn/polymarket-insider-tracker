@@ -1,180 +1,190 @@
-# Polymarket Insider Tracker
+# Polymarket Strategy Tracker
 
-Daily automated scan for wallets exhibiting insider-consistent behavior on Polymarket.
-Runs on GitHub Actions and delivers a formatted email report every morning.
+Twice-daily automated scan for wallet+market alerts on Polymarket.
 
----
+The tracker now uses a four-bucket strategy model and scores each alert into one best-fit strategy bucket:
+- `insider`
+- `sports_news`
+- `momentum`
+- `contrarian`
 
-## What It Does
+It runs on GitHub Actions or locally, saves structured artifacts, and emails a bucketed HTML report.
 
-Every day at 08:00 UTC the tracker:
-1. Scans 150 active Polymarket markets for volume anomalies
-2. Extracts all trades above $5,000 USDC
-3. Groups trades by wallet address
-4. Enriches each wallet using Polygonscan + Arkham Intelligence + Dune Analytics
-5. Scores each wallet (0–100+) using 11 insider-signal criteria
-6. Emails you a formatted HTML report with every flagged wallet
+## Project Reference
 
----
+For Codex work, the repo-level instruction source of truth is [AGENTS.md](AGENTS.md).
 
-## Suspicion Score Criteria
+Use `README.md` for human-facing setup and usage.
 
-| Signal | Points |
-|---|---|
-| Wallet age < 30 days on Polygon | +20 |
-| Large bet ($5k+) in niche market (<$200k TVL) | +20 |
-| Zero hedging (pure YES or pure NO only) | +15 |
-| Bet placed within 72h of market resolution | +15 |
-| Win rate ≥ 60% on longshot (<20%) markets | +20 |
-| Bridge funding within 72h of bet | +10 |
-| Mixer/Tornado Cash funding detected | +25 |
-| Arkham: linked to project treasury or fund | +20 |
-| Coordinated wallet cluster (3+ linked addresses) | +15 |
-| Confirmed by Dune whale list | +10 |
-| Confirmed by Dune new-wallet list | +10 |
+## What The Tracker Does
 
-Wallets scoring **≥ 40** appear in the watchlist.
+Each run:
+1. Fetches active Polymarket markets
+2. Flags markets with niche-liquidity or volume-spike behavior
+3. Pulls recent market trades and builds wallet+market alerts
+4. Enriches selected wallets with Polymarket, Polygonscan, Arkham, and optional Dune context
+5. Computes shared alert features once
+6. Scores all four buckets and assigns one best bucket per alert
+7. Writes artifacts and sends an email report
 
----
+## Strategy Buckets
 
-## Setup Guide
+### `insider`
+For politics, finance, crypto-event, and other asymmetric-information setups.
 
-### Step 1 — Create the GitHub Repository
+### `sports_news`
+For sports-only, news/event-driven edges such as lineup, injury, weather, or other late-breaking information.
 
-1. Go to [github.com/new](https://github.com/new)
-2. Create a **private** repository (recommended — this contains your API keys logic)
-3. Upload or push all files from this folder to the repo root
+### `momentum`
+For price-discovery and continuation setups.
 
-Your repo structure should look like:
-```
-your-repo/
-├── .github/
-│   └── workflows/
-│       └── daily_scan.yml
-├── src/
-│   ├── __init__.py
-│   ├── fetchers.py
-│   ├── scorer.py
-│   └── reporter.py
-├── main.py
-├── requirements.txt
-└── README.md
-```
+### `contrarian`
+For overstretched moves and reversal/fade setups.
 
----
+## Main Artifacts
 
-### Step 2 — Get Your API Keys
+Each run writes:
+- `STATUS.md`
+- `watchlist.json`
+- `review_log.json`
+- `tuning_summary.json`
+- `tuning_checklist.md`
 
-#### Polygonscan
-1. Go to [polygonscan.com/apis](https://polygonscan.com/apis)
-2. Create a free account → My Profile → API Keys → Add
-3. Copy the key
+### `STATUS.md`
+Short-term continuity file for current architecture state, current thresholds, known traps, and next review triggers.
+Use this together with `AGENTS.md` when resuming work in a fresh Codex or Claude session.
 
-#### Dune Analytics
-1. Go to [dune.com/settings/api](https://dune.com/settings/api)
-2. Create a free account → Settings → API → Generate new key
-3. Copy the key
+### `watchlist.json`
+The main structured run output.
 
-#### Arkham Intelligence
-1. Go to [platform.arkhamintelligence.com](https://platform.arkhamintelligence.com)
-2. Create account → Settings → API → Generate key
-3. Copy the key
+Includes:
+- `stats`
+- `bucket_thresholds`
+- `candidate_pool`
+- `watchlist`
+- `review_summary`
+- paths to the review and tuning artifacts
 
-#### Gmail App Password
-1. Go to your Google Account → [Security](https://myaccount.google.com/security)
-2. Enable **2-Step Verification** (required for App Passwords)
-3. Search "App passwords" → Select app: Mail → Device: Other → name it "polymarket-tracker"
-4. Google will show you a **16-character password** — copy it immediately (shown only once)
+### `review_log.json`
+Durable alert review history.
 
----
+Tracks:
+- `alert_id`
+- generated time
+- bucket
+- entry price
+- 1h / 6h / 24h moves when available
+- resolution outcome when available
+- review status
 
-### Step 3 — Add Secrets to GitHub
+### `tuning_summary.json`
+Machine-readable tuning snapshot built from the current `watchlist.json` payload and `review_log.json`.
 
-1. Go to your GitHub repo → **Settings** → **Secrets and variables** → **Actions**
-2. Click **"New repository secret"** and add each of the following:
+Includes:
+- run coverage
+- bucket funnel
+- bucket performance
+- risk-shape indicators
+- feature-combo leaderboard
+- review backlog
+- fixed-rule tuning recommendations
 
-| Secret Name | Value | Where to get it |
-|---|---|---|
-| `POLYGONSCAN_API_KEY` | Your Polygonscan API key | Step 2 above |
-| `DUNE_API_KEY` | Your Dune Analytics key | Step 2 above |
-| `ARKHAM_API_KEY` | Your Arkham Intelligence key | Step 2 above |
-| `GMAIL_USER` | Your full Gmail address | e.g. `you@gmail.com` |
-| `GMAIL_APP_PASSWORD` | The 16-char app password | Step 2 above |
-| `EMAIL_TO` | Email to send reports to | Can be same as GMAIL_USER |
+### `tuning_checklist.md`
+Human-readable run checklist with these sections:
+1. Run Health
+2. Bucket Funnel
+3. Bucket Performance
+4. Risk Flags
+5. Suggested Actions
+6. Hold / Observe / Tune Decisions
 
----
+## Setup
 
-### Step 4 — Run Your First Test
+### Local
 
-1. Go to your repo → **Actions** tab
-2. Click **"Polymarket Insider Tracker"** in the left sidebar
-3. Click **"Run workflow"** → **"Run workflow"**
-4. Watch the logs in real time
-5. Check your inbox — the report should arrive within ~5 minutes
+Create a virtualenv and install requirements:
 
----
-
-### Step 5 — Adjust the Schedule (Optional)
-
-The default schedule is **08:00 UTC daily**. To change it, edit `.github/workflows/daily_scan.yml`:
-
-```yaml
-- cron: "0 8 * * *"   # Change 8 to any hour (0-23 UTC)
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements.txt
 ```
 
-Examples:
-- `"0 6 * * *"` → 06:00 UTC (good for Asia/Taipei: 14:00 TWN)
-- `"0 0 * * *"` → midnight UTC
-- `"0 8,20 * * *"` → twice a day (08:00 and 20:00 UTC)
+Set runtime secrets in `.env` or your shell:
+- `POLYGONSCAN_API_KEY`
+- `DUNE_API_KEY`
+- `ARKHAM_API_KEY`
+- `GMAIL_USER`
+- `GMAIL_APP_PASSWORD`
+- `EMAIL_TO`
 
-For **Taipei timezone (UTC+8)**, use `"0 0 * * *"` to receive the email at 08:00 TWN.
+Run:
 
----
+```bash
+. .venv/bin/activate
+python main.py
+```
 
-### Step 6 — View Saved Watchlists
+### GitHub Actions
 
-After each run, a `watchlist.json` file is saved as a GitHub Actions artifact:
-1. Go to **Actions** → click any completed run
-2. Scroll down to **Artifacts** → download `watchlist-XXXXXX`
-3. Open the JSON to see the full structured data for every flagged wallet
+Store the same values as repository secrets and run the workflow manually first to validate email delivery.
 
----
+## Key Runtime Controls
 
-## Tuning Parameters
+Environment variables:
+- `MIN_CANDIDATE_SCORE`
+- `MIN_INSIDER_CONFIDENCE`
+- `MIN_SPORTS_CONFIDENCE`
+- `MIN_MOMENTUM_SCORE`
+- `MIN_CONTRARIAN_SCORE`
+- `MAX_WALLETS_TO_SCORE`
+- `MARKET_TRADE_LIMIT`
+- `PREFERRED_TAGS`
+- `EXCLUDED_CATEGORIES`
 
-Edit `src/scorer.py` to adjust thresholds:
+Default preferred tags include sports.
 
-| Variable | Default | Effect |
-|---|---|---|
-| `MIN_BET_USDC` | 5,000 | Minimum trade size to flag |
-| `MAX_NICHE_TVL` | 200,000 | Market TVL below which = "niche" |
-| `WALLET_AGE_DAYS` | 30 | Wallets newer than this get flagged |
-| `TIMING_HOURS` | 72 | Bet within N hours of resolution = suspicious |
-| `LONGSHOT_THRESHOLD` | 0.20 | Probability below which = longshot |
-| `MIN_LONGSHOT_WIN_RATE` | 0.60 | Win rate on longshots to trigger flag |
+## Tuning Workflow
 
----
+The tracker is designed for low-cost, evidence-based tuning:
+- per run: inspect `tuning_checklist.md`
+- weekly: consider one threshold or one weight change per bucket at most
+- monthly: review bucket health and artifact quality
 
-## Data Sources
+Guiding rules:
+- do not tune from one run
+- prefer threshold changes before weight changes
+- use resolved evidence from `review_log.json`
+- keep sports in `sports_news`, not inside the generic insider lane
 
-| Source | What It Provides | Required? |
-|---|---|---|
-| Polymarket CLOB/Gamma API | Markets, trades, positions, wallet history | Yes (free, no key) |
-| Polygonscan | USDC funding source, wallet age, mixer detection | Recommended |
-| Dune Analytics | Whale wallets, new large bettors | Recommended |
-| Arkham Intelligence | Entity labels, wallet clustering | Optional |
+## Email Report
 
-The tracker degrades gracefully — it will still run and email you even if some API keys are missing.
+The HTML report now shows bucketed sections instead of one generic insider list:
+- Insider Strategy
+- Sports News Strategy
+- Momentum Strategy
+- Contrarian Strategy
 
----
+Each alert card shows:
+- bucket score
+- candidate score
+- core reasons
+- caution flags
+- recent trades
+- active exposure summary
+- review status
 
-## Email Report Layout
+## Tests
 
-Each flagged wallet card shows:
-- **Suspicion score** (color-coded: red/orange/yellow)
-- **Quick-links** to Polymarket profile, Polygonscan, Arkham
-- **Stats**: overall win rate, longshot win rate, total resolved markets
-- **Active positions**: market name, side, size, entry price, TVL, resolution date
-- **Score flags**: which of the 11 criteria were triggered
-- **Funding warnings**: mixer or bridge detection results
-- **Alert triggers**: what to watch for next
+Run:
+
+```bash
+python3 -m unittest discover -s tests
+```
+
+The test suite covers:
+- shared feature logic
+- bucket routing
+- report rendering
+- tuning summary generation
+- tuning recommendation rules

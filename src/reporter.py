@@ -1,411 +1,598 @@
 """
-reporter.py — Formats the watchlist into a clean HTML email and sends it via Gmail.
+reporter.py — Formats the strategy watchlist into email and Telegram digests.
 """
 
+from __future__ import annotations
+
+import html
+import logging
 import os
 import smtplib
-import logging
+import time
 from datetime import datetime, timezone
-from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from pathlib import Path
+
+try:
+    import requests as _requests
+except ImportError:  # pragma: no cover - lets report rendering tests run without deps installed
+    _requests = None
 
 log = logging.getLogger(__name__)
 
-GMAIL_USER     = os.environ.get("GMAIL_USER", "")
+GMAIL_USER = os.environ.get("GMAIL_USER", "")
 GMAIL_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
-EMAIL_TO       = os.environ.get("EMAIL_TO", GMAIL_USER)
+EMAIL_TO = os.environ.get("EMAIL_TO", GMAIL_USER)
+EMAIL_RETRY_COUNT = int(os.environ.get("EMAIL_RETRY_COUNT", "1"))
+EMAIL_RETRY_DELAY_SECONDS = int(os.environ.get("EMAIL_RETRY_DELAY_SECONDS", "30"))
+
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+TELEGRAM_API = "https://api.telegram.org"
+
+EMAIL_BUCKET_ORDER = ["insider", "sports_news", "momentum", "contrarian"]
+EMAIL_BUCKET_LIMIT = int(os.environ.get("EMAIL_BUCKET_LIMIT", "5"))
+BUCKET_LABELS = {
+    "insider": "Insider Strategy",
+    "sports_news": "Sports News Strategy",
+    "momentum": "Momentum Strategy",
+    "contrarian": "Contrarian Strategy",
+}
+BUCKET_DESCRIPTIONS = {
+    "insider": "Politics, finance, crypto-event, and asymmetric-information style alerts.",
+    "sports_news": "Sports-only late-news, lineup, injury, or weather-driven alerts.",
+    "momentum": "Follow-through and price-discovery alerts where the move is still running.",
+    "contrarian": "Fade or reversal alerts where the move already looks stretched.",
+}
+BUCKET_COLORS = {
+    "insider": ("#2b6cb0", "#63b3ed"),
+    "sports_news": ("#b7791f", "#f6ad55"),
+    "momentum": ("#2f855a", "#68d391"),
+    "contrarian": ("#c05621", "#f6ad55"),
+}
+
+
+def _html(value) -> str:
+    if value is None:
+        return ""
+    return html.escape(str(value), quote=True)
+
+
+def _tg_escape(text: str) -> str:
+    for ch in r"\_*[]()~`>#+-=|{}.!":
+        text = text.replace(ch, f"\\{ch}")
+    return text
+
+
+def send_telegram_message(text: str, parse_mode: str = "MarkdownV2") -> bool:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("[Telegram] Not configured — set TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID")
+        return False
+    if _requests is None:
+        log.warning("[Telegram] requests is not installed")
+        return False
+    try:
+        response = _requests.post(
+            f"{TELEGRAM_API}/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": parse_mode},
+            timeout=10,
+        )
+        if not response.ok:
+            log.error(f"[Telegram] Send failed: {response.status_code} {response.text[:200]}")
+            return False
+        return True
+    except Exception as exc:
+        log.error(f"[Telegram] Error: {exc}")
+        return False
 
 
 def _score_color(score: int) -> str:
     if score >= 70:
-        return "#e53e3e"   # red — high risk
-    if score >= 50:
-        return "#dd6b20"   # orange — medium
+        return "#e53e3e"
+    if score >= 55:
+        return "#dd6b20"
     if score >= 40:
-        return "#d69e2e"   # yellow — watch
-    return "#38a169"       # green — low
+        return "#d69e2e"
+    return "#38a169"
 
 
-def _flag_icon(val) -> str:
-    if val is True:
-        return "🚩"
-    if val is False:
-        return "✅"
-    return "➖"
+def _group_watchlist(watchlist: list[dict]) -> dict[str, list[dict]]:
+    grouped = {bucket: [] for bucket in EMAIL_BUCKET_ORDER}
+    for alert in watchlist:
+        grouped.setdefault(alert.get("best_bucket", "insider"), []).append(alert)
+    for bucket in grouped:
+        grouped[bucket].sort(key=lambda alert: (-alert.get("best_score", 0), -alert.get("candidate_score", 0)))
+    return grouped
 
 
-def _format_wallet(w: dict) -> str:
-    addr    = w["wallet_address"]
-    score   = w["suspicion_score"]
-    color   = _score_color(score)
-    flags   = w.get("score_breakdown", {})
-    hist    = w.get("historical_record", {})
-    pos     = w.get("active_positions", [])
-    alerts  = w.get("alert_triggers", [])
-    funding = w.get("funding_warnings", [])
-    label   = w.get("entity_label", "Unknown")
-    etype   = w.get("entity_type", "unknown")
+def _is_thin_edge_follow(alert: dict) -> bool:
+    return bool(alert.get("thin_edge_follow"))
 
-    polygonscan_url = f"https://polygonscan.com/address/{addr}"
-    polymarket_url  = f"https://polymarket.com/profile/{addr}"
-    arkham_url      = f"https://platform.arkhamintelligence.com/explorer/address/{addr}"
 
-    # Active positions table rows
-    pos_rows = ""
-    for p in pos:
-        side    = p.get("side", "BUY").upper()
-        outcome = p.get("outcome", "")
-        side_color = "#38a169" if side == "BUY" else "#e53e3e"
+def _split_bucket_alerts(alerts: list[dict]) -> tuple[list[dict], list[dict]]:
+    primary = [alert for alert in alerts if not _is_thin_edge_follow(alert)]
+    thin_edge = [alert for alert in alerts if _is_thin_edge_follow(alert)]
+    return primary, thin_edge
 
-        # Format resolution date + days remaining
-        end_raw  = p.get("market_end") or "?"
-        end_str  = "?"
-        days_str = ""
-        if end_raw and end_raw != "?":
-            try:
-                end_dt   = datetime.fromisoformat(str(end_raw).replace("Z", "+00:00"))
-                end_str  = end_dt.strftime("%b %d %Y")
-                days_left = (end_dt - datetime.now(timezone.utc)).days
-                if days_left >= 0:
-                    days_str = f" ({days_left}d)"
-            except Exception:
-                end_str = str(end_raw)[:10]
 
-        # ── Category badge + sports warning
-        category = p.get("category", "Other")
-        cat_colors = {
-            "Sports":   ("#744210", "#f6ad55"),   # orange bg, orange text
-            "Politics": ("#1a365d", "#63b3ed"),   # blue
-            "Crypto":   ("#1c4532", "#68d391"),   # green
-            "Finance":  ("#322659", "#b794f4"),   # purple
-            "Other":    ("#1a202c", "#a0aec0"),   # grey
-        }
-        cat_bg, cat_fg = cat_colors.get(category, cat_colors["Other"])
-        cat_badge = (
-            f'<span style="background:{cat_bg};color:{cat_fg};font-size:10px;'
-            f'font-weight:700;padding:1px 5px;border-radius:3px;margin-right:4px;'
-            f'vertical-align:middle;">{category}</span>'
-        )
-        sports_warning = ""
-        if category == "Sports":
-            sports_warning = (
-                '<br><span style="color:#e53e3e;font-size:10px;font-weight:600;">'
-                '⚠️ 體育市場 — 可能不是 Insider，請自行判斷</span>'
-            )
+def _build_action_text(alert: dict) -> str:
+    action = (alert.get("recommended_action") or "follow").lower()
+    outcome = alert.get("suggested_outcome")
+    if outcome:
+        return f"{action.title()} {outcome}"
+    return action.title()
 
-        # ── Market name: show FULL name, never truncate the end
-        # The key info (date, specific condition) is usually at the END of the question
-        market_name = p["market_name"]
-        # Split into two lines if long: first 60 chars + rest on second line
-        if len(market_name) > 65:
-            split_idx   = market_name.rfind(" ", 0, 65)
-            split_idx   = split_idx if split_idx > 30 else 65
-            name_line1  = market_name[:split_idx]
-            name_line2  = f'<br><span style="color:#a0aec0;">{market_name[split_idx:].strip()}</span>'
-        else:
-            name_line1 = market_name
-            name_line2 = ""
 
-        # ── Side + outcome: always show YES/NO prominently
-        # For binary markets: "BUY YES" / "BUY NO"
-        # For multi-outcome: "BUY · Overpass"
-        outcome_upper = outcome.upper()
-        if outcome_upper in ("YES", "NO"):
-            outcome_color  = "#38a169" if outcome_upper == "YES" else "#e53e3e"
-            position_label = (
-                f'<span style="color:{side_color};font-weight:700;">{side}</span> ' +
-                f'<span style="color:{outcome_color};font-weight:700;font-size:13px;">{outcome_upper}</span>'
-            )
-        elif outcome and outcome_upper not in ("BUY", "SELL", ""):
-            position_label = (
-                f'<span style="color:{side_color};font-weight:700;">{side}</span> ' +
-                f'<span style="color:#e2e8f0;">· {outcome}</span>'
-            )
-        else:
-            position_label = f'<span style="color:{side_color};font-weight:700;">{side}</span>'
+def send_telegram_alerts(watchlist: list[dict], stats: dict, arb_alerts: list | None = None) -> bool:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
 
-        pos_rows += f"""
+    arb_alerts = arb_alerts or []
+    bucketed = _group_watchlist(watchlist)
+    run_date = datetime.now(timezone.utc).strftime("%b %d %H:%M UTC")
+
+    def _send_block(lines: list[str]) -> bool:
+        message = "\n".join(lines)
+        if len(message) > 4000:
+            message = message[:3950] + "\n\\.\\.\\. \\(truncated\\)"
+        return send_telegram_message(message)
+
+    ok = True
+    ok = _send_block([
+        f"🔍 *Polymarket Strategy Tracker* · {_tg_escape(run_date)}",
+        "",
+        f"📊 *{stats.get('flagged_alerts', 0)} alerts* · *{len(arb_alerts)} arb*",
+        f"Markets scanned: {stats.get('markets_scanned', 0)} · Large trades: {stats.get('large_trades', 0)}",
+        f"Buckets: insider {stats.get('insider_watchlist', 0)} · sports {stats.get('sports_watchlist', 0)} · "
+        f"momentum {stats.get('momentum_watchlist', 0)} · contrarian {stats.get('contrarian_watchlist', 0)}",
+    ]) and ok
+
+    if arb_alerts:
+        arb_lines = ["", "💰 *ARBITRAGE OPPORTUNITIES*"]
+        for arb in arb_alerts[:4]:
+            arb_lines.extend([
+                "",
+                f"• {_tg_escape(arb['market'][:55])}",
+                f"  YES ask `{arb['yes_ask']}` \\+ NO ask `{arb['no_ask']}` \\= `{arb['combined']}`",
+                f"  Net edge: *\\+{arb['net_arb_pct']}%* \\| Max profit: `${arb.get('max_profit_usdc', 0):,.0f}`",
+            ])
+        ok = _send_block(arb_lines) and ok
+
+    bucket_lines = []
+    thin_edge_lines = []
+    for bucket in EMAIL_BUCKET_ORDER:
+        primary_alerts, thin_edge_alerts = _split_bucket_alerts(bucketed.get(bucket, []))
+        alerts = primary_alerts[:2]
+        if alerts:
+            bucket_lines.extend(["", f"*{_tg_escape(BUCKET_LABELS[bucket])}*"])
+            for alert in alerts:
+                exposure = alert.get("active_exposure", {})
+                bucket_lines.extend([
+                    f"• {_tg_escape(alert['market_name'][:60])}",
+                    f"  {_tg_escape(alert['wallet_address'][:10])}… \\| score *{alert['best_score']}* \\| candidate {alert['candidate_score']}",
+                    f"  Action: *{_tg_escape(_build_action_text(alert))}* \\| size `${exposure.get('dominant_usdc', 0):,.0f}`",
+                ])
+
+        thin_alerts = thin_edge_alerts[:2]
+        if not thin_alerts:
+            continue
+        thin_edge_lines.extend(["", f"*{_tg_escape(BUCKET_LABELS[bucket])} — Thin Edge*"])
+        for alert in thin_alerts:
+            exposure = alert.get("active_exposure", {})
+            thin_edge_lines.extend([
+                f"• {_tg_escape(alert['market_name'][:60])}",
+                f"  {_tg_escape(alert['wallet_address'][:10])}… \\| score *{alert['best_score']}* \\| candidate {alert['candidate_score']}",
+                f"  Action: *{_tg_escape(_build_action_text(alert))}* \\| entry `{exposure.get('entry_price', 'N/A')}` \\| size `${exposure.get('dominant_usdc', 0):,.0f}`",
+            ])
+    if bucket_lines:
+        ok = _send_block(bucket_lines) and ok
+    if thin_edge_lines:
+        ok = _send_block(["", "⚠️ *Thin-Edge Follow Alerts*", "Visible for monitoring, but entry price is already close to 1.00.", *thin_edge_lines]) and ok
+
+    ok = _send_block(["", "_Not financial advice\\. Always DYOR\\._"]) and ok
+    return ok
+
+
+def _reason_pills(values: list[str], bg: str, fg: str) -> str:
+    return "".join(
+        f'<span style="display:inline-block;margin:3px 6px 3px 0;padding:3px 8px;border-radius:999px;'
+        f'background:{bg};color:{fg};font-size:11px;">{_html(value)}</span>'
+        for value in values
+    )
+
+
+def _trade_table(trades: list[dict]) -> str:
+    rows = ""
+    for trade in trades[:5]:
+        side = trade.get("side", "BUY").upper()
+        outcome = trade.get("outcome", "UNKNOWN")
+        side_color = "#68d391" if side == "BUY" else "#fc8181"
+        rows += f"""
         <tr>
-          <td style="padding:6px 10px;border-bottom:1px solid #2d3748;max-width:260px;font-size:12px;line-height:1.4;">{cat_badge}{name_line1}{name_line2}{sports_warning}</td>
-          <td style="padding:6px 10px;border-bottom:1px solid #2d3748;text-align:center;white-space:nowrap;">{position_label}</td>
-          <td style="padding:6px 10px;border-bottom:1px solid #2d3748;text-align:right;">${p['amount_usdc']:,.0f}</td>
-          <td style="padding:6px 10px;border-bottom:1px solid #2d3748;text-align:center;">{p['entry_price']:.2f}</td>
-          <td style="padding:6px 10px;border-bottom:1px solid #2d3748;text-align:right;">${p['market_liquidity']:,.0f}</td>
-          <td style="padding:6px 10px;border-bottom:1px solid #2d3748;text-align:center;white-space:nowrap;">{end_str}<span style="color:#e53e3e;">{days_str}</span></td>
-        </tr>"""
-
-    pos_table = f"""
+          <td style="padding:6px 8px;border-bottom:1px solid #2d3748;">{_html(trade.get('timestamp', '')[:16].replace('T', ' '))}</td>
+          <td style="padding:6px 8px;border-bottom:1px solid #2d3748;color:{side_color};font-weight:700;">{_html(side)}</td>
+          <td style="padding:6px 8px;border-bottom:1px solid #2d3748;">{_html(outcome)}</td>
+          <td style="padding:6px 8px;border-bottom:1px solid #2d3748;text-align:right;">${trade.get('amount_usdc', 0):,.0f}</td>
+          <td style="padding:6px 8px;border-bottom:1px solid #2d3748;text-align:center;">{trade.get('price', 0):.3f}</td>
+        </tr>
+        """
+    return f"""
     <table style="width:100%;border-collapse:collapse;font-size:12px;color:#e2e8f0;margin-top:8px;">
       <thead>
         <tr style="background:#2d3748;">
-          <th style="padding:6px 10px;text-align:left;">Market</th>
-          <th style="padding:6px 10px;">Side · Outcome</th>
-          <th style="padding:6px 10px;text-align:right;">Size (USDC)</th>
-          <th style="padding:6px 10px;">Entry</th>
-          <th style="padding:6px 10px;text-align:right;">Market TVL</th>
-          <th style="padding:6px 10px;">Resolves</th>
+          <th style="padding:6px 8px;text-align:left;">Time</th>
+          <th style="padding:6px 8px;text-align:left;">Side</th>
+          <th style="padding:6px 8px;text-align:left;">Outcome</th>
+          <th style="padding:6px 8px;text-align:right;">USDC</th>
+          <th style="padding:6px 8px;text-align:center;">Price</th>
         </tr>
       </thead>
-      <tbody>{pos_rows if pos_rows else '<tr><td colspan="6" style="padding:8px 10px;color:#718096;">No qualifying positions found</td></tr>'}</tbody>
-    </table>""" if pos else '<p style="color:#718096;font-size:12px;">No active positions extracted.</p>'
+      <tbody>{rows}</tbody>
+    </table>
+    """
 
-    # Score breakdown pills
-    flag_items = [
-        ("New Wallet (<30d)",       flags.get("new_wallet")),
-        ("Large Niche Bet",         flags.get("large_bet_niche")),
-        ("Capital Impact ≥10% TVL", flags.get("capital_impact")),
-        ("Zero Hedging",            flags.get("zero_hedge")),
-        ("Fake Hedge",              flags.get("decoy_hedge")),
-        ("Timing Sniper",           flags.get("immaculate_timing")),
-        ("Longshot Win Rate",       flags.get("longshot_flag")),
-        ("Bridge Funding",          flags.get("bridge_flag")),
-        ("Mixer Funding",           flags.get("mixer_flag")),
-        ("Mixer Urgency <1hr",      flags.get("mixer_urgency")),
-        ("Arkham Project Link",     flags.get("arkham_project_link")),
-        ("Coordinated Cluster",     flags.get("coordinated_cluster")),
-        ("Coordinated Swarm",       flags.get("coordinated_swarm")),
-        ("Dune Whale",              flags.get("dune_whale_flag")),
-        ("Dune New Wallet",         flags.get("dune_new_wallet_flag")),
-    ]
 
-    flags_html = ""
-    for name, val in flag_items:
-        bg = "#742a2a" if val is True else "#1a202c"
-        border = "#e53e3e" if val is True else "#4a5568"
-        icon = _flag_icon(val)
-        flags_html += f'<span style="display:inline-block;margin:3px 4px 3px 0;padding:3px 8px;border:1px solid {border};border-radius:4px;background:{bg};font-size:11px;">{icon} {name}</span>'
+def _format_alert(alert: dict) -> str:
+    bucket = alert.get("best_bucket", "insider")
+    border, accent = BUCKET_COLORS.get(bucket, ("#2d3748", "#63b3ed"))
+    score = alert.get("best_score", 0)
+    score_color = _score_color(score)
+    exposure = alert.get("active_exposure", {})
+    shared = alert.get("shared_features", {})
+    history = alert.get("historical_record", {})
 
-    # Historical stats
-    ls_rate = hist.get("longshot_win_rate")
-    ls_str  = f"{ls_rate:.0%}" if ls_rate is not None else "N/A"
-    ov_rate = hist.get("overall_win_rate")
-    ov_str  = f"{ov_rate:.0%}" if ov_rate is not None else "N/A"
+    wallet = alert["wallet_address"]
+    market = _html(alert["market_name"])
+    market_end = _html(alert.get("market_end") or "?")
+    action_text = _build_action_text(alert)
+    review_status = alert.get("review_status", "pending")
+    entity_label = _html(alert.get("entity_label", "Unknown"))
+    entity_type = _html(alert.get("entity_type", "unknown"))
 
-    # Alert badges
-    alert_html = ""
-    for a in alerts:
-        alert_html += f'<span style="display:inline-block;margin:2px 4px 2px 0;padding:2px 8px;background:#744210;border-radius:3px;font-size:11px;color:#fbd38d;">⚡ {a}</span>'
+    polygonscan_url = f"https://polygonscan.com/address/{wallet}"
+    polymarket_url = f"https://polymarket.com/profile/{wallet}"
+    arkham_url = f"https://platform.arkhamintelligence.com/explorer/address/{wallet}"
 
-    # Funding warnings
-    funding_html = ""
-    for f in funding:
-        funding_html += f'<div style="margin:3px 0;padding:4px 8px;background:#742a2a;border-left:3px solid #e53e3e;border-radius:2px;font-size:11px;">{f}</div>'
+    reason_html = _reason_pills(alert.get("core_reasons", []), "#1a365d", "#bee3f8")
+    caution_html = _reason_pills(alert.get("caution_flags", []), "#742a2a", "#feb2b2")
+    funding_html = "".join(
+        f'<div style="margin:4px 0;padding:6px 8px;background:#742a2a;border-left:3px solid #e53e3e;'
+        f'border-radius:3px;font-size:11px;color:#fed7d7;">{_html(item)}</div>'
+        for item in alert.get("funding_warnings", [])
+    )
 
-    # Tier banner
-    tier       = w.get("tier")
-    tier_sizing = w.get("tier_sizing", "—")
-    tier_exit   = w.get("tier_exit", "—")
-    cat_adj     = w.get("category_adjustment", 0)
-    dom_cat     = w.get("dominant_category", "")
-
-    tier_colors = {"Tier 3": "#e53e3e", "Tier 2": "#dd6b20", "Tier 1": "#d69e2e"}
-    tier_color  = tier_colors.get(tier, "#4a5568")
-
-    if tier:
-        tier_banner = f'''
-    <div style="background:#1a202c;border:1px solid {tier_color};border-radius:6px;padding:10px 14px;margin-bottom:12px;">
-      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;">
-        <span style="color:{tier_color};font-weight:800;font-size:14px;">📊 {tier} — Allocate {tier_sizing} of portfolio</span>
-        <span style="color:#a0aec0;font-size:11px;">💰 Take Profit: {tier_exit}</span>
-      </div>
-      {f'<div style="margin-top:6px;font-size:11px;color:#a0aec0;">Category: <b>{dom_cat}</b> — Score adjusted by {cat_adj:+d} pts</div>' if cat_adj != 0 else ""}
-    </div>'''
-    else:
-        tier_banner = ""
+    overall_wr = history.get("overall_win_rate")
+    longshot_wr = history.get("longshot_win_rate")
+    overall_wr_text = f"{overall_wr:.0%}" if overall_wr is not None else "N/A"
+    longshot_wr_text = f"{longshot_wr:.0%}" if longshot_wr is not None else "N/A"
 
     return f"""
-    <div style="background:#1a202c;border:1px solid {color};border-radius:8px;margin-bottom:24px;overflow:hidden;">
-
-      <!-- Header bar -->
-      <div style="background:{color};padding:10px 16px;display:flex;justify-content:space-between;align-items:center;">
-        <span style="font-weight:700;font-size:15px;color:#fff;">Score: {score}</span>
-        <span style="font-size:12px;color:#fff;opacity:0.9;">{label} · {etype}</span>
+    <div style="background:#1a202c;border:1px solid {border};border-radius:10px;margin-bottom:18px;overflow:hidden;">
+      <div style="background:{border};padding:12px 16px;display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap;">
+        <div>
+          <div style="font-size:15px;font-weight:700;color:#fff;">{market}</div>
+          <div style="font-size:12px;color:#e2e8f0;">{_html(BUCKET_LABELS[bucket])} · {_html(alert.get('category', 'Other'))} · {_html(action_text)}</div>
+        </div>
+        <div style="text-align:right;">
+          <div style="font-size:20px;font-weight:800;color:#fff;">{score}</div>
+          <div style="font-size:11px;color:#e2e8f0;">bucket score · candidate {alert.get('candidate_score', 0)}</div>
+        </div>
       </div>
 
       <div style="padding:16px;">
-
-        <!-- Address + links -->
-        <div style="margin-bottom:12px;font-family:monospace;font-size:12px;color:#a0aec0;">
-          <span style="color:#e2e8f0;">{addr}</span>
-          &nbsp;
-          <a href="{polymarket_url}" style="color:#63b3ed;text-decoration:none;">[Polymarket]</a>
+        <div style="font-family:monospace;font-size:12px;color:#a0aec0;margin-bottom:10px;">
+          {_html(wallet)}
+          <a href="{polymarket_url}" style="color:#63b3ed;text-decoration:none;margin-left:8px;">[Polymarket]</a>
           <a href="{polygonscan_url}" style="color:#63b3ed;text-decoration:none;margin-left:6px;">[Polygonscan]</a>
           <a href="{arkham_url}" style="color:#63b3ed;text-decoration:none;margin-left:6px;">[Arkham]</a>
         </div>
 
-        <!-- Stats row -->
-        <div style="display:flex;gap:16px;margin-bottom:14px;flex-wrap:wrap;">
-          <div style="background:#2d3748;padding:8px 14px;border-radius:6px;text-align:center;">
-            <div style="font-size:18px;font-weight:700;color:#e2e8f0;">{ov_str}</div>
-            <div style="font-size:10px;color:#718096;">Overall Win Rate</div>
-            <div style="font-size:10px;color:#718096;">{hist.get('total_wins',0)}W / {hist.get('total_resolved',0)} resolved</div>
+        <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:14px;">
+          <div style="background:#2d3748;border-radius:8px;padding:10px 12px;min-width:120px;">
+            <div style="font-size:22px;font-weight:800;color:{score_color};">{score}</div>
+            <div style="font-size:10px;color:#a0aec0;">Best Bucket Score</div>
           </div>
-          <div style="background:#2d3748;padding:8px 14px;border-radius:6px;text-align:center;">
-            <div style="font-size:18px;font-weight:700;color:#e2e8f0;">{ls_str}</div>
-            <div style="font-size:10px;color:#718096;">Longshot Win Rate</div>
-            <div style="font-size:10px;color:#718096;">{hist.get('longshot_wins',0)}W / {hist.get('longshot_total',0)} &lt;20% bets</div>
+          <div style="background:#2d3748;border-radius:8px;padding:10px 12px;min-width:120px;">
+            <div style="font-size:22px;font-weight:800;color:#e2e8f0;">{alert.get('candidate_score', 0)}</div>
+            <div style="font-size:10px;color:#a0aec0;">Candidate Score</div>
           </div>
-          <div style="background:#2d3748;padding:8px 14px;border-radius:6px;text-align:center;">
-            <div style="font-size:18px;font-weight:700;color:#e2e8f0;">{w.get('polygon_tx_count',0)}</div>
-            <div style="font-size:10px;color:#718096;">Polygon Txns</div>
+          <div style="background:#2d3748;border-radius:8px;padding:10px 12px;min-width:120px;">
+            <div style="font-size:22px;font-weight:800;color:#e2e8f0;">${exposure.get('dominant_usdc', 0):,.0f}</div>
+            <div style="font-size:10px;color:#a0aec0;">Dominant Exposure</div>
           </div>
-          <div style="background:#2d3748;padding:8px 14px;border-radius:6px;text-align:center;">
-            <div style="font-size:18px;font-weight:700;color:#e2e8f0;">{flags.get('wallet_age_days', '?')}</div>
-            <div style="font-size:10px;color:#718096;">Days on Polygon</div>
+          <div style="background:#2d3748;border-radius:8px;padding:10px 12px;min-width:120px;">
+            <div style="font-size:22px;font-weight:800;color:#e2e8f0;">{exposure.get('dominant_outcome', 'UNKNOWN')}</div>
+            <div style="font-size:10px;color:#a0aec0;">Dominant Outcome</div>
+          </div>
+          <div style="background:#2d3748;border-radius:8px;padding:10px 12px;min-width:120px;">
+            <div style="font-size:22px;font-weight:800;color:#e2e8f0;">{overall_wr_text}</div>
+            <div style="font-size:10px;color:#a0aec0;">Overall Win Rate</div>
+          </div>
+          <div style="background:#2d3748;border-radius:8px;padding:10px 12px;min-width:120px;">
+            <div style="font-size:22px;font-weight:800;color:#e2e8f0;">{review_status}</div>
+            <div style="font-size:10px;color:#a0aec0;">Review Status</div>
           </div>
         </div>
 
-        <!-- Tier banner + position sizing -->
-        {tier_banner}
+        <div style="margin-bottom:12px;">
+          <div style="font-size:12px;font-weight:700;color:{accent};margin-bottom:6px;">Core Reasons</div>
+          {reason_html or '<div style="font-size:12px;color:#a0aec0;">No strong reason flags.</div>'}
+        </div>
 
-        <!-- Alert triggers -->
-        {f'<div style="margin-bottom:10px;">{alert_html}</div>' if alerts else ''}
+        <div style="margin-bottom:12px;">
+          <div style="font-size:12px;font-weight:700;color:#feb2b2;margin-bottom:6px;">Caution Flags</div>
+          {caution_html or '<div style="font-size:12px;color:#a0aec0;">No major caution flags.</div>'}
+        </div>
 
-        <!-- Funding warnings -->
-        {f'<div style="margin-bottom:12px;">{funding_html}</div>' if funding else ''}
+        {f'<div style="margin-bottom:12px;">{funding_html}</div>' if funding_html else ''}
 
-        <!-- Score flags -->
-        <div style="margin-bottom:14px;">{flags_html}</div>
+        <div style="background:#111827;border:1px solid #2d3748;border-radius:8px;padding:12px;margin-bottom:12px;font-size:12px;color:#e2e8f0;line-height:1.6;">
+          <div><b>Action:</b> {_html(action_text)}</div>
+          <div><b>Entity:</b> {entity_label} ({entity_type})</div>
+          <div><b>Liquidity:</b> ${shared.get('market_liquidity', 0):,.0f} · <b>Capital impact:</b> {shared.get('capital_impact_pct', 0):.1f}% · <b>Hedge ratio:</b> {exposure.get('hedge_ratio', 0):.2f}</div>
+          <div><b>Entry price:</b> {exposure.get('entry_price') if exposure.get('entry_price') is not None else 'N/A'} · <b>Ends:</b> {market_end}</div>
+          <div><b>History:</b> {history.get('total_wins', 0)}W / {history.get('total_resolved', 0)} resolved · <b>Longshot WR:</b> {longshot_wr_text}</div>
+        </div>
 
-        <!-- Active positions -->
-        <div style="font-size:12px;font-weight:600;color:#a0aec0;margin-bottom:4px;">ACTIVE POSITIONS IN FLAGGED MARKETS</div>
-        {pos_table}
-
+        <div style="font-size:12px;font-weight:700;color:#a0aec0;margin-bottom:4px;">Recent Trades In This Alert</div>
+        {_trade_table(alert.get('recent_trades', []))}
       </div>
-    </div>"""
+    </div>
+    """
 
 
-def build_html_report(watchlist: list[dict], run_date: str, stats: dict, contrarian_alerts: list = None) -> str:
-    contrarian_alerts = contrarian_alerts or []
-    if not watchlist:
-        body = '<p style="color:#a0aec0;text-align:center;padding:40px;">No wallets exceeded the suspicion threshold today.</p>'
-    else:
-        body = "".join(_format_wallet(w) for w in sorted(watchlist, key=lambda x: -x["suspicion_score"]))
-
-    # Build contrarian section
-    if contrarian_alerts:
-        c_rows = ""
-        for c in contrarian_alerts:
-            spike_color = "#e53e3e" if c["direction"] == "UP" else "#38a169"
-            c_rows += f"""
-            <tr>
-              <td style="padding:6px 10px;border-bottom:1px solid #2d3748;font-size:12px;">{c["market"][:60]}</td>
-              <td style="padding:6px 10px;border-bottom:1px solid #2d3748;text-align:center;">
-                <span style="color:{spike_color};font-weight:700;">{c["direction"]} {c["spike_pct"]}%</span>
-              </td>
-              <td style="padding:6px 10px;border-bottom:1px solid #2d3748;text-align:center;">{c["price_from"]} → {c["price_to"]}</td>
-              <td style="padding:6px 10px;border-bottom:1px solid #2d3748;text-align:center;">{c["window_mins"]:.0f} min</td>
-              <td style="padding:6px 10px;border-bottom:1px solid #2d3748;text-align:center;">
-                <span style="color:#68d391;font-weight:700;">{c["opportunity"]}</span>
-              </td>
-            </tr>"""
-        contrarian_section = f"""
-    <div style="background:#1a202c;border:1px solid #276749;border-radius:8px;margin-bottom:24px;overflow:hidden;">
-      <div style="background:#276749;padding:10px 16px;">
-        <span style="font-weight:700;font-size:14px;color:#fff;">⚡ Contrarian Opportunities — Possible Dumb Money Detected</span>
-        <span style="font-size:11px;color:#c6f6d5;margin-left:8px;">Price spiked &gt;30% in &lt;1hr with no news — consider opposite side</span>
-      </div>
-      <div style="padding:12px;">
+def _build_arb_section(arb_alerts: list[dict]) -> str:
+    if not arb_alerts:
+        return ""
+    rows = ""
+    for arb in arb_alerts[:8]:
+        rows += f"""
+        <tr>
+          <td style="padding:6px 10px;border-bottom:1px solid #2d3748;">{_html(arb['market'][:70])}</td>
+          <td style="padding:6px 10px;border-bottom:1px solid #2d3748;text-align:center;">{arb['yes_ask']:.4f}</td>
+          <td style="padding:6px 10px;border-bottom:1px solid #2d3748;text-align:center;">{arb['no_ask']:.4f}</td>
+          <td style="padding:6px 10px;border-bottom:1px solid #2d3748;text-align:center;">{arb['combined']:.4f}</td>
+          <td style="padding:6px 10px;border-bottom:1px solid #2d3748;text-align:center;color:#68d391;font-weight:700;">+{arb['net_arb_pct']}%</td>
+          <td style="padding:6px 10px;border-bottom:1px solid #2d3748;text-align:right;">${arb.get('max_profit_usdc', 0):,.0f}</td>
+        </tr>
+        """
+    return f"""
+    <div style="background:#1a202c;border:1px solid #2c7a7b;border-radius:10px;margin-bottom:22px;overflow:hidden;">
+      <div style="background:#2c7a7b;padding:12px 16px;color:#fff;font-size:15px;font-weight:700;">Direct Arbitrage Opportunities</div>
+      <div style="padding:14px;">
         <table style="width:100%;border-collapse:collapse;font-size:12px;color:#e2e8f0;">
           <thead>
             <tr style="background:#2d3748;">
               <th style="padding:6px 10px;text-align:left;">Market</th>
-              <th style="padding:6px 10px;">Spike</th>
-              <th style="padding:6px 10px;">Price Move</th>
-              <th style="padding:6px 10px;">Window</th>
-              <th style="padding:6px 10px;">Opportunity</th>
+              <th style="padding:6px 10px;">YES Ask</th>
+              <th style="padding:6px 10px;">NO Ask</th>
+              <th style="padding:6px 10px;">Combined</th>
+              <th style="padding:6px 10px;">Net Edge</th>
+              <th style="padding:6px 10px;text-align:right;">Max Profit</th>
             </tr>
           </thead>
-          <tbody>{c_rows}</tbody>
+          <tbody>{rows}</tbody>
         </table>
       </div>
-    </div>"""
-    else:
-        contrarian_section = ""
+    </div>
+    """
+
+
+def _build_run_health_banner(run_health: dict | None) -> str:
+    if not run_health:
+        return ""
+
+    status = run_health.get("status", "healthy")
+    reason = run_health.get("reason")
+    request_health = run_health.get("request_health", {})
+
+    if status == "healthy":
+        return ""
+
+    return f"""
+    <div style="background:#3b1d1d;border:1px solid #e53e3e;border-radius:10px;padding:16px;margin-bottom:22px;color:#fed7d7;">
+      <div style="font-size:16px;font-weight:800;color:#feb2b2;margin-bottom:6px;">Run Unhealthy</div>
+      <div style="font-size:13px;line-height:1.5;">
+        This run did not produce a valid market scan. Upstream network or DNS requests failed during execution.
+      </div>
+        <div style="font-size:12px;line-height:1.6;margin-top:10px;color:#fbd38d;">
+        <div><b>Reason:</b> {_html(reason or "Unknown error")}</div>
+        <div><b>Successful calls:</b> {request_health.get('successful_calls', 0)} · <b>Failed calls:</b> {request_health.get('failed_calls', 0)} · <b>Attempt failures:</b> {request_health.get('attempt_failures', 0)}</div>
+      </div>
+    </div>
+    """
+
+
+def _build_thin_edge_section(grouped: dict[str, list[dict]]) -> str:
+    sections = []
+    for bucket in EMAIL_BUCKET_ORDER:
+        _, thin_edge_alerts = _split_bucket_alerts(grouped.get(bucket, []))
+        alerts = thin_edge_alerts[:EMAIL_BUCKET_LIMIT]
+        if not alerts:
+            continue
+        border, accent = BUCKET_COLORS[bucket]
+        sections.append(
+            f"""
+            <div style="margin-bottom:16px;">
+              <div style="font-size:16px;font-weight:800;color:{accent};margin-bottom:4px;">{BUCKET_LABELS[bucket]} · Thin Edge</div>
+              <div style="font-size:12px;color:#a0aec0;margin-bottom:12px;">These are still shown for monitoring, but the entry is already close to 1.00 and leaves less upside.</div>
+              {''.join(_format_alert(alert) for alert in alerts)}
+            </div>
+            """
+        )
+
+    if not sections:
+        return ""
+
+    return (
+        '<div style="margin-top:26px;padding-top:18px;border-top:1px solid #2d3748;">'
+        '<div style="font-size:18px;font-weight:800;color:#f6ad55;margin-bottom:8px;">Thin-Edge Follow Alerts</div>'
+        '<div style="font-size:12px;color:#a0aec0;margin-bottom:14px;">'
+        'These alerts still passed the strategy threshold, but the wallet entered at a price that is already very close to settlement. '
+        'Keep them visible for context, but treat them as lower-edge follow setups.'
+        '</div>'
+        + "".join(sections)
+        + '</div>'
+    )
+
+
+def build_html_report(
+    watchlist: list[dict],
+    run_date: str,
+    stats: dict,
+    arb_alerts: list | None = None,
+    run_health: dict | None = None,
+) -> str:
+    arb_alerts = arb_alerts or []
+    grouped = _group_watchlist(watchlist)
+    sections = []
+    thin_edge_section = _build_thin_edge_section(grouped)
+
+    for bucket in EMAIL_BUCKET_ORDER:
+        primary_alerts, _ = _split_bucket_alerts(grouped.get(bucket, []))
+        alerts = primary_alerts[:EMAIL_BUCKET_LIMIT]
+        if not alerts:
+            continue
+        border, accent = BUCKET_COLORS[bucket]
+        sections.append(
+            f"""
+            <div style="margin-bottom:16px;">
+              <div style="font-size:16px;font-weight:800;color:{accent};margin-bottom:4px;">{BUCKET_LABELS[bucket]}</div>
+              <div style="font-size:12px;color:#a0aec0;margin-bottom:12px;">{BUCKET_DESCRIPTIONS[bucket]}</div>
+              {''.join(_format_alert(alert) for alert in alerts)}
+            </div>
+            """
+        )
+
+    body = "".join(sections) if sections else (
+        '<div style="background:#1a202c;border:1px solid #2d3748;border-radius:10px;padding:28px;text-align:center;color:#a0aec0;">'
+        'No alerts cleared the bucket thresholds on this run.</div>'
+    )
+
+    health_banner = _build_run_health_banner(run_health)
 
     return f"""<!DOCTYPE html>
 <html>
-<head><meta charset="UTF-8"><title>Polymarket Insider Watchlist</title></head>
+<head><meta charset="UTF-8"><title>Polymarket Strategy Watchlist</title></head>
 <body style="margin:0;padding:0;background:#0f1117;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#e2e8f0;">
-
-  <div style="max-width:800px;margin:0 auto;padding:24px 16px;">
-
-    <!-- Header -->
-    <div style="background:linear-gradient(135deg,#1a365d,#2d3748);border-radius:10px;padding:24px;margin-bottom:24px;border:1px solid #2d3748;">
-      <h1 style="margin:0 0 6px;font-size:22px;color:#63b3ed;">🔍 Polymarket Insider Watchlist</h1>
-      <p style="margin:0;color:#a0aec0;font-size:13px;">Daily scan · {run_date}</p>
+  <div style="max-width:920px;margin:0 auto;padding:24px 16px;">
+    <div style="background:linear-gradient(135deg,#1f2937,#111827);border:1px solid #2d3748;border-radius:12px;padding:22px;margin-bottom:22px;">
+      <h1 style="margin:0 0 6px;font-size:24px;color:#e2e8f0;">Polymarket Strategy Watchlist</h1>
+      <div style="font-size:13px;color:#9ca3af;">{run_date}</div>
     </div>
 
-    <!-- Summary stats -->
-    <div style="display:flex;gap:12px;margin-bottom:24px;flex-wrap:wrap;">
-      <div style="flex:1;min-width:120px;background:#1a202c;border:1px solid #2d3748;border-radius:8px;padding:14px;text-align:center;">
-        <div style="font-size:28px;font-weight:700;color:#e53e3e;">{stats.get('flagged_wallets',0)}</div>
-        <div style="font-size:11px;color:#718096;">Flagged Wallets</div>
+    {health_banner}
+
+    <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:22px;">
+      <div style="flex:1;min-width:130px;background:#1a202c;border:1px solid #2d3748;border-radius:10px;padding:14px;text-align:center;">
+        <div style="font-size:30px;font-weight:800;color:#e2e8f0;">{stats.get('flagged_alerts', 0)}</div>
+        <div style="font-size:11px;color:#9ca3af;">Watchlist Alerts</div>
       </div>
-      <div style="flex:1;min-width:120px;background:#1a202c;border:1px solid #2d3748;border-radius:8px;padding:14px;text-align:center;">
-        <div style="font-size:28px;font-weight:700;color:#dd6b20;">{stats.get('markets_scanned',0)}</div>
-        <div style="font-size:11px;color:#718096;">Markets Scanned</div>
+      <div style="flex:1;min-width:130px;background:#1a202c;border:1px solid #2d3748;border-radius:10px;padding:14px;text-align:center;">
+        <div style="font-size:30px;font-weight:800;color:#e2e8f0;">{stats.get('candidate_alerts', 0)}</div>
+        <div style="font-size:11px;color:#9ca3af;">Stage-1 Candidates</div>
       </div>
-      <div style="flex:1;min-width:120px;background:#1a202c;border:1px solid #2d3748;border-radius:8px;padding:14px;text-align:center;">
-        <div style="font-size:28px;font-weight:700;color:#d69e2e;">{stats.get('large_trades',0)}</div>
-        <div style="font-size:11px;color:#718096;">Large Trades Found</div>
+      <div style="flex:1;min-width:130px;background:#1a202c;border:1px solid #2b6cb0;border-radius:10px;padding:14px;text-align:center;">
+        <div style="font-size:30px;font-weight:800;color:#63b3ed;">{stats.get('insider_watchlist', 0)}</div>
+        <div style="font-size:11px;color:#9ca3af;">Insider</div>
       </div>
-      <div style="flex:1;min-width:120px;background:#1a202c;border:1px solid #2d3748;border-radius:8px;padding:14px;text-align:center;">
-        <div style="font-size:28px;font-weight:700;color:#38a169;">{stats.get('data_sources_active',0)}/4</div>
-        <div style="font-size:11px;color:#718096;">Data Sources Active</div>
+      <div style="flex:1;min-width:130px;background:#1a202c;border:1px solid #b7791f;border-radius:10px;padding:14px;text-align:center;">
+        <div style="font-size:30px;font-weight:800;color:#f6ad55;">{stats.get('sports_watchlist', 0)}</div>
+        <div style="font-size:11px;color:#9ca3af;">Sports News</div>
+      </div>
+      <div style="flex:1;min-width:130px;background:#1a202c;border:1px solid #2f855a;border-radius:10px;padding:14px;text-align:center;">
+        <div style="font-size:30px;font-weight:800;color:#68d391;">{stats.get('momentum_watchlist', 0)}</div>
+        <div style="font-size:11px;color:#9ca3af;">Momentum</div>
+      </div>
+      <div style="flex:1;min-width:130px;background:#1a202c;border:1px solid #c05621;border-radius:10px;padding:14px;text-align:center;">
+        <div style="font-size:30px;font-weight:800;color:#f6ad55;">{stats.get('contrarian_watchlist', 0)}</div>
+        <div style="font-size:11px;color:#9ca3af;">Contrarian</div>
+      </div>
+      <div style="flex:1;min-width:130px;background:#1a202c;border:1px solid #2d3748;border-radius:10px;padding:14px;text-align:center;">
+        <div style="font-size:30px;font-weight:800;color:#e2e8f0;">{len(arb_alerts)}</div>
+        <div style="font-size:11px;color:#9ca3af;">Arb Opportunities</div>
       </div>
     </div>
 
-    <!-- Score legend -->
-    <div style="background:#1a202c;border:1px solid #2d3748;border-radius:8px;padding:12px 16px;margin-bottom:24px;font-size:12px;">
-      <span style="color:#718096;margin-right:12px;">Score legend:</span>
-      <span style="color:#e53e3e;margin-right:12px;">■ 70+ High Alert</span>
-      <span style="color:#dd6b20;margin-right:12px;">■ 50–69 Medium</span>
-      <span style="color:#d69e2e;margin-right:12px;">■ 40–49 Watch</span>
-    </div>
-
-    <!-- Contrarian opportunities -->
-    {contrarian_section}
-
-    <!-- Watchlist -->
+    {_build_arb_section(arb_alerts)}
     {body}
+    {thin_edge_section}
 
-    <!-- Footer -->
-    <div style="margin-top:24px;padding:16px;border-top:1px solid #2d3748;font-size:11px;color:#4a5568;text-align:center;">
-      Generated by Polymarket Insider Tracker · For informational purposes only.<br>
-      Not financial advice. Always do your own research.
+    <div style="margin-top:24px;padding:16px;border-top:1px solid #2d3748;font-size:11px;color:#6b7280;text-align:center;">
+      Generated by Polymarket Strategy Tracker. Informational only, not financial advice.
     </div>
-
-  </div>
+    </div>
 </body>
 </html>"""
 
 
-def send_email(watchlist: list[dict], stats: dict, contrarian_alerts: list = None) -> bool:
+def write_html_report(
+    watchlist: list[dict],
+    stats: dict,
+    arb_alerts: list | None = None,
+    run_health: dict | None = None,
+    output_path: str = "report.html",
+) -> str:
+    arb_alerts = arb_alerts or []
+    run_date = datetime.now(timezone.utc).strftime("%A, %B %d %Y · %H:%M UTC")
+    html_body = build_html_report(
+        watchlist,
+        run_date,
+        stats,
+        arb_alerts=arb_alerts,
+        run_health=run_health,
+    )
+    Path(output_path).write_text(html_body, encoding="utf-8")
+    log.info(f"HTML report written to {output_path}")
+    return output_path
+
+
+def send_email(
+    watchlist: list[dict],
+    stats: dict,
+    arb_alerts: list | None = None,
+    run_health: dict | None = None,
+) -> bool:
     if not GMAIL_USER or not GMAIL_PASSWORD:
         log.error("Gmail credentials not configured. Set GMAIL_USER and GMAIL_APP_PASSWORD.")
         return False
 
-    contrarian_alerts = contrarian_alerts or []
+    arb_alerts = arb_alerts or []
     run_date = datetime.now(timezone.utc).strftime("%A, %B %d %Y · %H:%M UTC")
-    n        = stats.get("flagged_wallets", 0)
-    c        = len(contrarian_alerts)
-    subject  = f"🔍 Polymarket Watchlist — {n} wallet{'s' if n!=1 else ''} flagged · {c} contrarian opp · {datetime.now(timezone.utc).strftime('%b %d')}"
-
-    html_body = build_html_report(watchlist, run_date, stats, contrarian_alerts=contrarian_alerts)
+    subject = (
+        f"Polymarket Strategy · {stats.get('flagged_alerts', 0)} alerts"
+        f"{f' · {len(arb_alerts)} arb' if arb_alerts else ''}"
+        f" · {datetime.now(timezone.utc).strftime('%b %d')}"
+    )
+    html_body = build_html_report(
+        watchlist,
+        run_date,
+        stats,
+        arb_alerts=arb_alerts,
+        run_health=run_health,
+    )
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
-    msg["From"]    = GMAIL_USER
-    msg["To"]      = EMAIL_TO
+    msg["From"] = GMAIL_USER
+    msg["To"] = EMAIL_TO
     msg.attach(MIMEText(html_body, "html"))
 
-    try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(GMAIL_USER, GMAIL_PASSWORD)
-            server.sendmail(GMAIL_USER, EMAIL_TO, msg.as_string())
-        log.info(f"Email sent to {EMAIL_TO}")
-        return True
-    except Exception as e:
-        log.error(f"Failed to send email: {e}")
-        return False
+    for attempt in range(EMAIL_RETRY_COUNT + 1):
+        try:
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+                server.login(GMAIL_USER, GMAIL_PASSWORD)
+                server.sendmail(GMAIL_USER, EMAIL_TO, msg.as_string())
+            log.info(f"Email sent to {EMAIL_TO}")
+            return True
+        except Exception as exc:
+            log.error(f"Failed to send email: {exc}")
+            if attempt >= EMAIL_RETRY_COUNT:
+                break
+            log.warning(
+                f"Retrying email delivery in {EMAIL_RETRY_DELAY_SECONDS}s "
+                f"(attempt {attempt + 2}/{EMAIL_RETRY_COUNT + 1})"
+            )
+            time.sleep(EMAIL_RETRY_DELAY_SECONDS)
+    return False
