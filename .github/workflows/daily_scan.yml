@@ -25,16 +25,18 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Restore paper portfolio
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: paper_portfolio.json
-          key: paper-portfolio
+          key: paper-portfolio-${{ github.run_id }}
+          restore-keys: paper-portfolio-
 
       - name: Restore review log
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: review_log.json
-          key: review-log
+          key: review-log-${{ github.run_id }}
+          restore-keys: review-log-
 
       - name: Run strategy tracker
         env:
@@ -46,6 +48,20 @@ jobs:
           EMAIL_TO:             ${{ secrets.EMAIL_TO }}
           MAX_WALLETS_TO_SCORE: "60"
         run: python main.py
+
+      - name: Save paper portfolio
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: paper_portfolio.json
+          key: paper-portfolio-${{ github.run_id }}
+
+      - name: Save review log
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: review_log.json
+          key: review-log-${{ github.run_id }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
