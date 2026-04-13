@@ -60,13 +60,24 @@ def save_portfolio(portfolio: dict, path: str = PORTFOLIO_PATH) -> None:
         json.dump(portfolio, f, indent=2)
 
 
+PAPER_MIN_REMAINING_EDGE = float(os.environ.get("PAPER_MIN_REMAINING_EDGE", "0.05"))
+
+
 def _position_size(alert: dict, capital: float) -> float:
-    """Size the paper position based on score and remaining edge."""
+    """Size the paper position based on score and remaining edge.
+
+    Full-signal entries (remaining >= 0.15) get normal sizing (2-10%).
+    Exploratory entries (0.05 <= remaining < 0.15) get 1% sizing to
+    gather data on whether high-entry trades are profitable.
+    """
     score = alert.get("best_score", 0)
     remaining = alert.get("shared_features", {}).get("remaining_edge_pct", 0)
 
-    if remaining < 0.15:
+    if remaining < PAPER_MIN_REMAINING_EDGE:
         return 0.0
+    # Exploratory tier: high entry price, small size just for data
+    if remaining < 0.15:
+        return round(min(capital * 0.01, capital), 2)
     if score >= 70 and remaining >= 0.30:
         return round(min(capital * 0.10, capital), 2)
     if score >= 50 and remaining >= 0.20:
@@ -130,10 +141,13 @@ def open_positions(portfolio: dict, watchlist: list[dict], fetch_clob_book=None)
             continue
 
         shares = round(size / entry_price, 4)
+        remaining = alert.get("shared_features", {}).get("remaining_edge_pct", 0)
+        signal_tier = "full" if remaining >= 0.15 else "exploratory"
 
         position = {
             "alert_id": alert_id,
             "bucket": alert.get("best_bucket", "unknown"),
+            "signal_tier": signal_tier,
             "market_name": alert.get("market_name", ""),
             "market_id": alert.get("market_id", ""),
             "suggested_outcome": alert.get("suggested_outcome"),
@@ -292,6 +306,15 @@ def portfolio_summary(portfolio: dict) -> dict:
 
     ready = total_closed >= 30 and total_pnl > 0
 
+    # Tier breakdown
+    all_positions = list(portfolio["open_positions"]) + list(portfolio["closed_positions"])
+    full_trades = [p for p in portfolio["closed_positions"] if p.get("signal_tier", "full") == "full"]
+    expl_trades = [p for p in portfolio["closed_positions"] if p.get("signal_tier") == "exploratory"]
+    full_pnl = sum(p.get("pnl_usdc", 0) or 0 for p in full_trades)
+    expl_pnl = sum(p.get("pnl_usdc", 0) or 0 for p in expl_trades)
+    full_wins = sum(1 for p in full_trades if p["status"] == "won")
+    expl_wins = sum(1 for p in expl_trades if p["status"] == "won")
+
     return {
         "starting_capital": portfolio["starting_capital"],
         "current_equity": round(total_equity, 2),
@@ -305,6 +328,10 @@ def portfolio_summary(portfolio: dict) -> dict:
         "total_pnl": round(total_pnl, 2),
         "total_pnl_pct": round(total_pnl / portfolio["starting_capital"] * 100, 2),
         "bucket_performance": portfolio.get("bucket_performance", {}),
+        "tier_breakdown": {
+            "full": {"closed": len(full_trades), "wins": full_wins, "pnl": round(full_pnl, 2)},
+            "exploratory": {"closed": len(expl_trades), "wins": expl_wins, "pnl": round(expl_pnl, 2)},
+        },
         "ready_for_real": ready,
         "ready_reason": (
             "30+ resolved trades with positive P&L" if ready

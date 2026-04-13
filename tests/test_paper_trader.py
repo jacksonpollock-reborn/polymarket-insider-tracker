@@ -64,8 +64,15 @@ class TestPositionSizing(unittest.TestCase):
         size = _position_size(alert, 100.0)
         self.assertEqual(size, 2.0)
 
-    def test_skip_low_edge(self):
+    def test_exploratory_tier(self):
+        """Entries with 0.05 <= remaining < 0.15 get 1% exploratory sizing."""
         alert = _make_alert(score=80, remaining_edge=0.10)
+        size = _position_size(alert, 100.0)
+        self.assertEqual(size, 1.0)
+
+    def test_skip_very_low_edge(self):
+        """Entries with remaining < 0.05 are skipped entirely."""
+        alert = _make_alert(score=80, remaining_edge=0.03)
         size = _position_size(alert, 100.0)
         self.assertEqual(size, 0.0)
 
@@ -103,9 +110,26 @@ class TestOpenPositions(unittest.TestCase):
         opened = open_positions(portfolio, alerts)
         self.assertEqual(opened, 0)
 
-    def test_skips_low_edge(self):
+    def test_opens_exploratory_position(self):
         portfolio = _empty_portfolio()
-        alerts = [_make_alert(remaining_edge=0.05)]
+        alerts = [_make_alert(remaining_edge=0.10)]
+        opened = open_positions(portfolio, alerts)
+        self.assertEqual(opened, 1)
+        pos = portfolio["open_positions"][0]
+        self.assertEqual(pos["signal_tier"], "exploratory")
+        self.assertEqual(pos["position_size_usdc"], 1.0)  # 1% of $100
+
+    def test_opens_full_signal_position(self):
+        portfolio = _empty_portfolio()
+        alerts = [_make_alert(remaining_edge=0.35)]
+        opened = open_positions(portfolio, alerts)
+        self.assertEqual(opened, 1)
+        pos = portfolio["open_positions"][0]
+        self.assertEqual(pos["signal_tier"], "full")
+
+    def test_skips_very_low_edge(self):
+        portfolio = _empty_portfolio()
+        alerts = [_make_alert(remaining_edge=0.03)]
         opened = open_positions(portfolio, alerts)
         self.assertEqual(opened, 0)
 
