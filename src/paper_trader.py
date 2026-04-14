@@ -144,6 +144,10 @@ def open_positions(portfolio: dict, watchlist: list[dict], fetch_clob_book=None)
         remaining = alert.get("shared_features", {}).get("remaining_edge_pct", 0)
         signal_tier = "full" if remaining >= 0.15 else "exploratory"
 
+        # Take profit must be meaningfully above entry, otherwise positions
+        # entered above the default TP fire immediately at a loss.
+        position_tp = min(0.99, max(DEFAULT_TAKE_PROFIT, round(entry_price + 0.05, 4)))
+
         position = {
             "alert_id": alert_id,
             "bucket": alert.get("best_bucket", "unknown"),
@@ -157,7 +161,7 @@ def open_positions(portfolio: dict, watchlist: list[dict], fetch_clob_book=None)
             "shares": shares,
             "opened_at": datetime.now(timezone.utc).isoformat(),
             "market_end": alert.get("market_end"),
-            "take_profit": DEFAULT_TAKE_PROFIT,
+            "take_profit": position_tp,
             "stop_loss": None,
             "status": "open",
             "exit_price": None,

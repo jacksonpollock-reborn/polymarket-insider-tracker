@@ -133,6 +133,34 @@ class TestOpenPositions(unittest.TestCase):
         opened = open_positions(portfolio, alerts)
         self.assertEqual(opened, 0)
 
+    def test_take_profit_above_entry_for_high_entries(self):
+        """Positions entered above the default 0.90 TP must get a TP > entry."""
+        portfolio = _empty_portfolio()
+        alerts = [_make_alert(entry_price=0.93, remaining_edge=0.07)]
+        open_positions(portfolio, alerts)
+        pos = portfolio["open_positions"][0]
+        # TP must be strictly greater than entry, or the position "wins" at a loss
+        self.assertGreater(pos["take_profit"], pos["paper_entry_price"])
+        self.assertAlmostEqual(pos["take_profit"], 0.98, places=4)
+
+    def test_take_profit_default_for_low_entries(self):
+        """Low-entry positions keep the default 0.90 TP."""
+        portfolio = _empty_portfolio()
+        alerts = [_make_alert(entry_price=0.50, remaining_edge=0.50)]
+        open_positions(portfolio, alerts)
+        pos = portfolio["open_positions"][0]
+        self.assertEqual(pos["take_profit"], 0.90)
+
+    def test_take_profit_capped_at_099(self):
+        """TP is capped at 0.99 to avoid impossible-to-trigger values."""
+        portfolio = _empty_portfolio()
+        alerts = [_make_alert(entry_price=0.97, remaining_edge=0.03)]
+        # This would normally skip (edge < 0.05), so use edge just above threshold
+        alerts = [_make_alert(entry_price=0.95, remaining_edge=0.05)]
+        open_positions(portfolio, alerts)
+        pos = portfolio["open_positions"][0]
+        self.assertLessEqual(pos["take_profit"], 0.99)
+
 
 class TestClosePositions(unittest.TestCase):
     def test_close_on_resolution_win(self):
