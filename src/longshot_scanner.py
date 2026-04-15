@@ -36,11 +36,14 @@ log = logging.getLogger(__name__)
 LONGSHOT_FADE_MIN_ASK = float(os.environ.get("LONGSHOT_FADE_MIN_ASK", "0.05"))
 LONGSHOT_FADE_MAX_ASK = float(os.environ.get("LONGSHOT_FADE_MAX_ASK", "0.15"))
 LONGSHOT_FADE_MIN_LIQUIDITY = float(os.environ.get("LONGSHOT_FADE_MIN_LIQUIDITY", "5000"))
-LONGSHOT_FADE_MIN_DAYS = float(os.environ.get("LONGSHOT_FADE_MIN_DAYS", "1"))
-# Long-dated markets are where the 5-15% longshot band actually lives on
-# Polymarket. Near-term markets in that band are rare (most are already
-# resolved or still 50/50). 180 days = ~6 months, a reasonable upper bound.
-LONGSHOT_FADE_MAX_DAYS = float(os.environ.get("LONGSHOT_FADE_MAX_DAYS", "180"))
+# Two distinct longshot-fade timeframes both exist on Polymarket:
+#   - Short-dated launch/events markets that resolve within hours
+#   - Long-dated championship/election/geopolitical markets (months out)
+# Keep the window wide so both classes are catchable. min_days=0.1 prevents
+# fading right at resolution (variance dominates). max_days=365 covers most
+# long-dated markets without indefinite capital lock-up.
+LONGSHOT_FADE_MIN_DAYS = float(os.environ.get("LONGSHOT_FADE_MIN_DAYS", "0.1"))
+LONGSHOT_FADE_MAX_DAYS = float(os.environ.get("LONGSHOT_FADE_MAX_DAYS", "365"))
 
 # ── Resolution proximity short params ─────────────────────────────────────────
 # Same band concept: only catch longshots that produce fade entries the paper

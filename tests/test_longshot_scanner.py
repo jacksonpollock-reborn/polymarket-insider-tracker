@@ -131,14 +131,14 @@ class TestLongshotFade(unittest.TestCase):
         self.assertIsNone(result)
 
     def test_skips_near_resolution_markets(self):
-        """days_to_end < 1 is below longshot_fade minimum."""
-        market = _make_market(days_to_end=0.5, yes_price=0.08, no_price=0.93)
+        """days_to_end < 0.1 is below longshot_fade minimum (avoid high variance)."""
+        market = _make_market(days_to_end=0.05, yes_price=0.08, no_price=0.92)
         result = scan_market_for_longshot(market)
         self.assertIsNone(result)
 
     def test_skips_too_distant_markets(self):
-        """days_to_end > 180 is above longshot_fade maximum."""
-        market = _make_market(days_to_end=200.0, yes_price=0.08, no_price=0.92)
+        """days_to_end > 365 is above longshot_fade maximum (too much capital lockup)."""
+        market = _make_market(days_to_end=400.0, yes_price=0.08, no_price=0.92)
         result = scan_market_for_longshot(market)
         self.assertIsNone(result)
 
