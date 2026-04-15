@@ -86,32 +86,47 @@ def _position_size(alert: dict, capital: float) -> float:
 
 
 def _get_live_price(alert: dict, fetch_clob_book) -> float | None:
-    """Fetch current best ask for the suggested outcome from CLOB."""
+    """
+    Return the best available entry price for a paper position.
+
+    Priority (first non-null wins):
+      1. The alert's `active_exposure.entry_price` — this is authoritative for
+         both whale-sourced alerts (the whale's actual entry) and synthetic
+         scanner alerts (the fade_entry_price from outcomePrices).
+      2. CLOB top-of-book ask — only used as a fallback, and only if it
+         looks like a real price (0.01 < ask < 0.99). Most Polymarket CLOBs
+         return 0.001/0.999 empty-book placeholders.
+
+    The previous version always tried CLOB first, which caused synthetic
+    longshot_fade alerts to paper-enter at 0.999 instead of the 0.91 their
+    scanner computed from the AMM pool price.
+    """
+    # Priority 1: alert-provided entry price (whale or scanner computed)
+    active = alert.get("active_exposure", {}) or {}
+    alert_entry = active.get("entry_price")
+    if alert_entry and 0.01 < float(alert_entry) < 0.99:
+        return float(alert_entry)
+
+    # Priority 2: CLOB top-of-book ask as fallback
     if fetch_clob_book is None:
         return None
-
     tokens = alert.get("tokens") or []
     suggested = (alert.get("suggested_outcome") or "").upper()
-
     token_id = None
     for t in tokens:
         if str(t.get("outcome", "")).upper() == suggested:
             token_id = t.get("token_id") or t.get("tokenId")
             break
-
     if not token_id:
-        market_id = alert.get("market_id", "")
-        active = alert.get("active_exposure", {})
-        entry = active.get("entry_price")
-        if entry and 0 < entry < 1:
-            return float(entry)
         return None
-
     try:
         book = fetch_clob_book(token_id)
         asks = book.get("asks", [])
         if asks:
-            return float(asks[0]["price"])
+            price = float(asks[0]["price"])
+            # Reject empty-book placeholders (0.001/0.999)
+            if 0.01 < price < 0.99:
+                return price
     except Exception as e:
         log.warning(f"[Paper] Failed to fetch live price: {e}")
     return None

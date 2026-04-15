@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from src.paper_trader import (
     _empty_portfolio,
+    _get_live_price,
     _position_size,
     close_positions,
     load_portfolio,
@@ -266,6 +267,80 @@ class TestPersistence(unittest.TestCase):
     def test_load_missing_file(self):
         portfolio = load_portfolio("/tmp/nonexistent_paper_portfolio.json")
         self.assertEqual(portfolio["starting_capital"], 100.0)
+
+
+class TestLivePriceResolution(unittest.TestCase):
+    """Regression tests for _get_live_price. The previous implementation
+    ignored the alert's entry_price and always fetched CLOB, which returned
+    the 0.999 empty-book placeholder for most Polymarket markets."""
+
+    def test_prefers_alert_entry_price_over_clob(self):
+        """A synthetic longshot alert has a real entry_price — don't override with CLOB."""
+        alert = {
+            "active_exposure": {"entry_price": 0.92},
+            "tokens": [{"outcome": "NO", "token_id": "tok-no"}],
+            "suggested_outcome": "NO",
+        }
+
+        def fake_clob(token_id):
+            # Empty-book placeholder (what the real CLOB returns for most markets)
+            return {"asks": [{"price": "0.999", "size": "100"}]}
+
+        price = _get_live_price(alert, fake_clob)
+        self.assertEqual(price, 0.92)
+
+    def test_falls_back_to_clob_when_alert_has_no_entry_price(self):
+        alert = {
+            "active_exposure": {},
+            "tokens": [{"outcome": "YES", "token_id": "tok-yes"}],
+            "suggested_outcome": "YES",
+        }
+
+        def fake_clob(token_id):
+            # Real mid-book price
+            return {"asks": [{"price": "0.65", "size": "100"}]}
+
+        price = _get_live_price(alert, fake_clob)
+        self.assertEqual(price, 0.65)
+
+    def test_rejects_empty_book_placeholder_in_fallback(self):
+        """Even in fallback, a 0.999 CLOB price must be rejected as a placeholder."""
+        alert = {
+            "active_exposure": {},
+            "tokens": [{"outcome": "YES", "token_id": "tok-yes"}],
+            "suggested_outcome": "YES",
+        }
+
+        def fake_clob(token_id):
+            return {"asks": [{"price": "0.999", "size": "100"}]}
+
+        price = _get_live_price(alert, fake_clob)
+        self.assertIsNone(price)
+
+    def test_opens_longshot_fade_at_scanner_price_not_clob_placeholder(self):
+        """End-to-end: a longshot fade alert with entry=0.915 must paper-trade at 0.915, not 0.999."""
+        portfolio = _empty_portfolio()
+        alert = {
+            "alert_id": "ls-001",
+            "best_bucket": "longshot_fade",
+            "best_score": 60,
+            "market_name": "Will Brazil win the 2026 World Cup?",
+            "market_id": "mkt-brazil",
+            "suggested_outcome": "NO",
+            "tokens": [{"outcome": "NO", "token_id": "tok-no"}],
+            "active_exposure": {"entry_price": 0.915, "dominant_outcome": "NO", "dominant_usdc": 0},
+            "shared_features": {"remaining_edge_pct": 0.085},
+        }
+
+        def fake_clob(token_id):
+            return {"asks": [{"price": "0.999", "size": "100"}]}
+
+        opened = open_positions(portfolio, [alert], fetch_clob_book=fake_clob)
+        self.assertEqual(opened, 1)
+        pos = portfolio["open_positions"][0]
+        self.assertEqual(pos["paper_entry_price"], 0.915)
+        # Sanity: position size must not be zero (regression from previous bugs)
+        self.assertGreater(pos["position_size_usdc"], 0)
 
 
 class TestReviewLogSync(unittest.TestCase):
