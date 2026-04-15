@@ -268,6 +268,110 @@ class TestPersistence(unittest.TestCase):
         self.assertEqual(portfolio["starting_capital"], 100.0)
 
 
+class TestReviewLogSync(unittest.TestCase):
+    """Part D: close_positions must mirror resolutions into review_log.json."""
+
+    def test_close_updates_review_log_entry(self):
+        # Create a review log with a pending entry matching the paper position
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            review_path = f.name
+        try:
+            existing = [{
+                "alert_id": "sync-001",
+                "generated_at": "2026-04-14T00:00:00+00:00",
+                "bucket": "insider",
+                "market_id": "mkt-sync",
+                "market_name": "Sync Test",
+                "entry_price": 0.65,
+                "review_status": "pending",
+                "price_at_resolution": None,
+                "resolved_outcome": None,
+            }]
+            with open(review_path, "w") as f:
+                json.dump(existing, f)
+
+            # Build a portfolio with a matching open position
+            portfolio = _empty_portfolio()
+            portfolio["current_capital"] = 90.0
+            portfolio["open_positions"] = [{
+                "alert_id": "sync-001",
+                "bucket": "insider",
+                "market_name": "Sync Test",
+                "market_id": "mkt-sync",
+                "suggested_outcome": "YES",
+                "whale_entry_price": 0.60,
+                "paper_entry_price": 0.65,
+                "position_size_usdc": 10.0,
+                "shares": 15.38,
+                "opened_at": "2026-04-14T00:00:00+00:00",
+                "market_end": "2026-04-15",
+                "take_profit": 0.90,
+                "stop_loss": None,
+                "status": "open",
+                "exit_price": None,
+                "pnl_usdc": None,
+                "pnl_pct": None,
+                "closed_at": None,
+            }]
+
+            # Patch the DEFAULT_REVIEW_LOG_PATH to point at our temp file
+            with patch("src.review.DEFAULT_REVIEW_LOG_PATH", review_path):
+                trades = [{"price": "0.98", "outcome": "YES", "timestamp": "2026-04-15T12:00:00Z"}]
+                closed = close_positions(portfolio, {"mkt-sync": trades})
+                self.assertEqual(closed, 1)
+
+            # Read back the review log and verify the entry was updated
+            with open(review_path) as f:
+                updated = json.load(f)
+            self.assertEqual(len(updated), 1)
+            entry = updated[0]
+            self.assertEqual(entry["alert_id"], "sync-001")
+            self.assertEqual(entry["review_status"], "resolved_win")
+            self.assertEqual(entry["resolved_outcome"], "won")
+            self.assertIsNotNone(entry.get("price_at_resolution"))
+            self.assertIn("paper_pnl_usdc", entry)
+        finally:
+            os.unlink(review_path)
+
+    def test_close_silent_when_no_matching_entry(self):
+        """Must not crash if the paper position has no review log entry."""
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            review_path = f.name
+        try:
+            with open(review_path, "w") as f:
+                json.dump([], f)
+
+            portfolio = _empty_portfolio()
+            portfolio["current_capital"] = 90.0
+            portfolio["open_positions"] = [{
+                "alert_id": "orphan-001",
+                "bucket": "longshot_fade",
+                "market_name": "Orphan",
+                "market_id": "mkt-orphan",
+                "suggested_outcome": "NO",
+                "whale_entry_price": 0.93,
+                "paper_entry_price": 0.93,
+                "position_size_usdc": 1.0,
+                "shares": 1.07,
+                "opened_at": "2026-04-14T00:00:00+00:00",
+                "market_end": "2026-04-15",
+                "take_profit": 0.98,
+                "stop_loss": None,
+                "status": "open",
+                "exit_price": None,
+                "pnl_usdc": None,
+                "pnl_pct": None,
+                "closed_at": None,
+            }]
+
+            with patch("src.review.DEFAULT_REVIEW_LOG_PATH", review_path):
+                trades = [{"price": "0.99", "outcome": "NO", "timestamp": "2026-04-15T12:00:00Z"}]
+                closed = close_positions(portfolio, {"mkt-orphan": trades})
+                self.assertEqual(closed, 1)
+        finally:
+            os.unlink(review_path)
+
+
 class TestUpdateIntegration(unittest.TestCase):
     def test_full_cycle(self):
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:

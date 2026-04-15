@@ -21,7 +21,7 @@ PORTFOLIO_PATH = os.environ.get("PAPER_PORTFOLIO_PATH", "paper_portfolio.json")
 STARTING_CAPITAL = float(os.environ.get("PAPER_STARTING_CAPITAL", "100"))
 DEFAULT_TAKE_PROFIT = float(os.environ.get("PAPER_TAKE_PROFIT", "0.90"))
 
-BUCKETS = ["insider", "sports_news", "momentum", "contrarian"]
+BUCKETS = ["insider", "sports_news", "momentum", "contrarian", "longshot_fade", "resolution_short"]
 
 
 def _empty_bucket_perf() -> dict:
@@ -260,6 +260,20 @@ def close_positions(portfolio: dict, market_trade_cache: dict | None = None) -> 
                 f"[Paper] CLOSED {status.upper()} | {pos['market_name'][:50]} | "
                 f"PnL ${pos['pnl_usdc']:+.2f} ({pos['pnl_pct']:+.1f}%)"
             )
+
+            # Side-channel: mirror the resolution into review_log.json so the
+            # durable review log accumulates paper-trade outcomes across runs.
+            # Silent on failure — must never break the main close loop.
+            try:
+                from src.review import record_paper_resolution
+                record_paper_resolution(
+                    alert_id=pos["alert_id"],
+                    status=status,
+                    exit_price=exit_price,
+                    pnl_usdc=pos["pnl_usdc"],
+                )
+            except Exception as exc:
+                log.debug(f"[Paper] review_log sync failed for {pos['alert_id']}: {exc}")
         else:
             still_open.append(pos)
 

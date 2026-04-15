@@ -56,6 +56,7 @@ from src.tuning import (
     write_tuning_artifacts,
 )
 from src.paper_trader import update_paper_portfolio, portfolio_summary
+from src.longshot_scanner import batch_scan_longshot, batch_scan_resolution_short
 
 logging.basicConfig(
     level=logging.INFO,
@@ -297,6 +298,10 @@ def _build_output_payload(
     watchlist: list[dict],
     review_summary: dict,
     run_health: dict | None = None,
+    arb_alerts: list[dict] | None = None,
+    near_miss_arb_alerts: list[dict] | None = None,
+    longshot_alerts: list[dict] | None = None,
+    resolution_short_alerts: list[dict] | None = None,
 ) -> dict:
     return {
         "generated_at": generated_at,
@@ -305,6 +310,10 @@ def _build_output_payload(
         "bucket_thresholds": BUCKET_THRESHOLDS,
         "candidate_pool": candidate_pool,
         "watchlist": watchlist,
+        "arb_alerts": arb_alerts or [],
+        "near_miss_arb_alerts": near_miss_arb_alerts or [],
+        "longshot_alerts": longshot_alerts or [],
+        "resolution_short_alerts": resolution_short_alerts or [],
         "review_summary": review_summary,
         "review_log_path": DEFAULT_REVIEW_LOG_PATH,
         "tuning_summary_path": TUNING_SUMMARY_PATH,
@@ -432,19 +441,30 @@ def run():
         return
 
     log.info("\n[1b/7] Scanning CLOB for arbitrage opportunities…")
-    arb_alerts = batch_scan_arb(markets, limit=80)
+    arb_alerts, near_miss_arb_alerts = batch_scan_arb(markets, limit=80)
     stats["arb_opportunities"] = len(arb_alerts)
+    stats["near_miss_arb_opportunities"] = len(near_miss_arb_alerts)
     if arb_alerts:
         log.info(f"  → {len(arb_alerts)} arb opportunities found")
     else:
         log.info("  → No arb gaps detected")
+    if near_miss_arb_alerts:
+        log.info(f"  → {len(near_miss_arb_alerts)} near-miss arb gaps (observability only)")
+
+    log.info("\n[1c/7] Scanning CLOB for longshot fade opportunities…")
+    longshot_alerts = batch_scan_longshot(markets, limit=80)
+    stats["longshot_fade_opportunities"] = len(longshot_alerts)
+
+    log.info("\n[1d/7] Scanning CLOB for resolution proximity shorts…")
+    resolution_short_alerts = batch_scan_resolution_short(markets, limit=80)
+    stats["resolution_short_opportunities"] = len(resolution_short_alerts)
 
     flagged_markets = flag_suspicious_markets(markets)
     stats["flagged_markets"] = len(flagged_markets)
     log.info(f"  → {len(flagged_markets)} markets flagged for deep scan")
 
-    if not flagged_markets and not arb_alerts:
-        log.warning("No watchlist candidates or arb opportunities today. Sending empty report.")
+    if not flagged_markets and not arb_alerts and not longshot_alerts and not resolution_short_alerts:
+        log.warning("No watchlist candidates, arb, longshot, or resolution-short opportunities today. Sending empty report.")
         review_entries = load_review_log(DEFAULT_REVIEW_LOG_PATH)
         _finalize_empty_run(
             run_started_at=run_started_at,
@@ -605,8 +625,13 @@ def run():
     )
 
     log.info("\n[6/7] Updating durable review log…")
+    # Sync watchlist + synthetic scanner alerts into the review log so paper
+    # resolutions from the scanners accumulate alongside whale alerts.
+    review_alert_batch = list(watchlist) + list(longshot_alerts) + list(resolution_short_alerts)
+    for alert in review_alert_batch:
+        alert.setdefault("generated_at", run_started_at)
     review_entries, review_summary = sync_review_log(
-        alerts=watchlist,
+        alerts=review_alert_batch,
         market_trade_cache=market_trade_cache,
         fetch_market_trades=fetch_market_trades,
         path=DEFAULT_REVIEW_LOG_PATH,
@@ -629,6 +654,10 @@ def run():
         watchlist=watchlist,
         review_summary=review_summary,
         run_health=_current_run_health(),
+        arb_alerts=arb_alerts,
+        near_miss_arb_alerts=near_miss_arb_alerts,
+        longshot_alerts=longshot_alerts,
+        resolution_short_alerts=resolution_short_alerts,
     )
     _write_output(payload)
     write_tuning_artifacts(payload, review_entries)
@@ -649,8 +678,11 @@ def run():
         log.warning("  → Telegram skipped")
 
     log.info("\n[Paper] Updating paper trading portfolio…")
+    # Merge whale watchlist alerts with synthetic CLOB-scan alerts so the paper
+    # trader sees all signals from a single pipeline.
+    paper_alerts = list(watchlist) + list(longshot_alerts) + list(resolution_short_alerts)
     paper_summary = update_paper_portfolio(
-        watchlist, market_trade_cache=market_trade_cache, fetch_clob_book=fetch_clob_book,
+        paper_alerts, market_trade_cache=market_trade_cache, fetch_clob_book=fetch_clob_book,
     )
     stats["paper_portfolio"] = paper_summary
 

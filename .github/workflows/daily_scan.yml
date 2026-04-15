@@ -48,6 +48,11 @@ jobs:
           GMAIL_APP_PASSWORD:   ${{ secrets.GMAIL_APP_PASSWORD }}
           EMAIL_TO:             ${{ secrets.EMAIL_TO }}
           MAX_WALLETS_TO_SCORE: "60"
+          NEAR_MISS_ARB_THRESHOLD: "0.98"
+          LONGSHOT_FADE_MAX_ASK: "0.12"
+          LONGSHOT_FADE_MIN_LIQUIDITY: "5000"
+          RESOLUTION_SHORT_MAX_ASK: "0.15"
+          RESOLUTION_SHORT_MIN_LIQUIDITY: "3000"
         run: python main.py
 
       - name: Save paper portfolio

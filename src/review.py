@@ -277,3 +277,89 @@ def sync_review_log(
     _save_review_log(updated_entries, path)
     return updated_entries, summarize_review_log(updated_entries)
 
+
+def record_paper_resolution(
+    alert_id: str,
+    status: str,
+    exit_price: float | None,
+    pnl_usdc: float | None,
+    path: str | None = None,
+) -> bool:
+    """
+    Update a review-log entry with a paper-trade resolution outcome.
+
+    Called by src/paper_trader.close_positions() when a paper position closes,
+    so that review_log.json accumulates resolved outcomes from every paper
+    trade — both whale-watchlist alerts AND synthetic scanner alerts
+    (longshot_fade, resolution_short).
+
+    Returns True if an entry was updated, False if no matching entry exists.
+    Silent on error (file missing, parse failure) — this is a side-channel
+    update that must never break the main paper-trader loop.
+    """
+    # Resolve path at call time so tests can patch DEFAULT_REVIEW_LOG_PATH
+    resolved_path = path if path is not None else DEFAULT_REVIEW_LOG_PATH
+    try:
+        entries = load_review_log(resolved_path)
+    except Exception:
+        return False
+
+    found = False
+    for entry in entries:
+        if entry.get("alert_id") != alert_id:
+            continue
+        found = True
+        # Map paper-trader status → review_status used by summarize/tuning
+        if status == "won":
+            entry["review_status"] = "resolved_win"
+            entry["resolved_outcome"] = "won"
+        elif status in ("lost", "stopped_out"):
+            entry["review_status"] = "resolved_loss"
+            entry["resolved_outcome"] = "lost"
+        elif status == "expired":
+            entry["review_status"] = "expired"
+            entry["resolved_outcome"] = "expired"
+        else:
+            entry["review_status"] = status
+
+        if exit_price is not None:
+            entry["price_at_resolution"] = round(float(exit_price), 4)
+        if pnl_usdc is not None:
+            entry["paper_pnl_usdc"] = round(float(pnl_usdc), 2)
+        entry["paper_resolved_at"] = datetime.now(timezone.utc).isoformat()
+        break
+
+    if found:
+        try:
+            _save_review_log(entries, resolved_path)
+        except Exception:
+            return False
+    return found
+
+
+def upsert_paper_alerts_to_review_log(
+    alerts: list[dict],
+    path: str = DEFAULT_REVIEW_LOG_PATH,
+) -> int:
+    """
+    Ensure paper-trader synthetic alerts (longshot_fade, resolution_short) exist
+    in review_log.json so later record_paper_resolution() calls can find them.
+
+    Uses _upsert_entries() so existing entries are preserved; only new alert IDs
+    are added. Returns count of newly-added entries.
+    """
+    try:
+        existing = load_review_log(path)
+    except Exception:
+        return 0
+    before = len(existing)
+    updated = _upsert_entries(existing, alerts)
+    merged = list(updated.values())
+    added = len(merged) - before
+    if added > 0:
+        merged.sort(key=lambda row: row.get("generated_at") or "", reverse=True)
+        try:
+            _save_review_log(merged, path)
+        except Exception:
+            return 0
+    return added

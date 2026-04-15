@@ -324,6 +324,7 @@ def fetch_arkham_entity(address):
 # Since arb execution should use limit orders for zero fees, the threshold is
 # set just below 1.0 to account for rounding and execution slippage only.
 ARB_THRESHOLD = float(os.environ.get("ARB_THRESHOLD", "0.995"))
+NEAR_MISS_ARB_THRESHOLD = float(os.environ.get("NEAR_MISS_ARB_THRESHOLD", "0.98"))
 
 # Category-specific taker fee rates (only used if executing as taker)
 TAKER_FEE_RATES = {
@@ -351,15 +352,18 @@ def fetch_clob_book(token_id: str) -> dict:
     return result or {}
 
 
-def scan_market_for_arb(market: dict) -> dict | None:
+def scan_market_for_arb(market: dict, near_miss_threshold: float | None = None) -> dict | None:
     """
     Check a single market for direct arbitrage.
 
     Fetches live best-ask prices for YES and NO tokens from the CLOB.
-    If best_ask_yes + best_ask_no < ARB_THRESHOLD (0.97), a risk-free
-    profit exists: buy both sides for < $0.97, collect $1.00 at resolution.
+    If best_ask_yes + best_ask_no < ARB_THRESHOLD (0.995), a risk-free
+    profit exists: buy both sides for < $0.995, collect $1.00 at resolution.
 
-    Returns an arb dict on opportunity, None otherwise.
+    When `near_miss_threshold` is set (e.g. 0.98), combined prices in the
+    range (ARB_THRESHOLD, near_miss_threshold) are ALSO returned, flagged
+    with is_near_miss=True. These are observability signals — we don't
+    paper-trade them, but we want to know they exist.
     """
     tokens = market.get("tokens") or []
     if len(tokens) < 2:
@@ -393,7 +397,11 @@ def scan_market_for_arb(market: dict) -> dict | None:
         return None
 
     combined = yes_ask + no_ask
-    if combined >= ARB_THRESHOLD:
+    is_arb = combined < ARB_THRESHOLD
+    is_near_miss = False
+    if not is_arb and near_miss_threshold is not None:
+        is_near_miss = combined < near_miss_threshold
+    if not is_arb and not is_near_miss:
         return None
 
     # Max fillable at the best ask levels (limited by smaller side)
@@ -427,13 +435,24 @@ def scan_market_for_arb(market: dict) -> dict | None:
         "liquidity":         float(market.get("liquidity") or 0),
         "category":          category,
         "days_to_end":       market.get("_days_to_end", 0),
+        "is_near_miss":      is_near_miss,
     }
 
 
-def batch_scan_arb(markets: list[dict], limit: int = 80) -> list[dict]:
+def batch_scan_arb(
+    markets: list[dict],
+    limit: int = 80,
+    near_miss_threshold: float | None = NEAR_MISS_ARB_THRESHOLD,
+) -> tuple[list[dict], list[dict]]:
     """
     Scan up to `limit` markets (sorted by 24h volume) for arb opportunities.
-    Returns list of arb dicts sorted by net_arb_pct descending.
+
+    Returns a tuple `(arb_alerts, near_miss_alerts)`:
+      - arb_alerts: combined < ARB_THRESHOLD (real arbs, tradeable)
+      - near_miss_alerts: ARB_THRESHOLD <= combined < near_miss_threshold
+        (observability only, NOT traded)
+
+    Pass near_miss_threshold=None to disable the shadow scan entirely.
     """
     candidates = sorted(
         markets,
@@ -441,17 +460,30 @@ def batch_scan_arb(markets: list[dict], limit: int = 80) -> list[dict]:
         reverse=True,
     )[:limit]
 
-    found = []
+    arb_found: list[dict] = []
+    near_miss_found: list[dict] = []
     for m in candidates:
-        arb = scan_market_for_arb(m)
-        if arb:
-            found.append(arb)
+        result = scan_market_for_arb(m, near_miss_threshold=near_miss_threshold)
+        if not result:
+            continue
+        if result.get("is_near_miss"):
+            near_miss_found.append(result)
             log.info(
-                f"[ARB] {arb['market'][:55]} | "
-                f"combined={arb['combined']} | +{arb['net_arb_pct']}% net | "
-                f"max ~${arb['max_profit_usdc']:,.0f}"
+                f"[ARB near-miss] {result['market'][:50]} | "
+                f"combined={result['combined']} (target < {ARB_THRESHOLD})"
+            )
+        else:
+            arb_found.append(result)
+            log.info(
+                f"[ARB] {result['market'][:55]} | "
+                f"combined={result['combined']} | +{result['net_arb_pct']}% net | "
+                f"max ~${result['max_profit_usdc']:,.0f}"
             )
 
-    found.sort(key=lambda a: a["net_arb_pct"], reverse=True)
-    log.info(f"[ARB] Scanned {len(candidates)} markets → {len(found)} arb opportunities found")
-    return found
+    arb_found.sort(key=lambda a: a["net_arb_pct"], reverse=True)
+    near_miss_found.sort(key=lambda a: a["combined"])
+    log.info(
+        f"[ARB] Scanned {len(candidates)} markets → "
+        f"{len(arb_found)} arb · {len(near_miss_found)} near-miss"
+    )
+    return arb_found, near_miss_found
