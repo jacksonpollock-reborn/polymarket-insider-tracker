@@ -19,6 +19,7 @@ and the same market shape.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 from datetime import datetime, timezone
@@ -73,7 +74,12 @@ def _get_market_end_days(market: dict) -> float | None:
 
 
 def _best_ask(book: dict) -> tuple[float | None, float | None]:
-    """Return (best_ask_price, best_ask_size) or (None, None) if book is empty."""
+    """Return (best_ask_price, best_ask_size) or (None, None) if book is empty.
+
+    Legacy helper: the CLOB order books for most Polymarket markets are
+    effectively empty (showing 0.001/0.999 placeholder bid/asks) because
+    liquidity flows through AMM pools. Kept for test compatibility.
+    """
     asks = book.get("asks", [])
     if not asks:
         return None, None
@@ -81,6 +87,49 @@ def _best_ask(book: dict) -> tuple[float | None, float | None]:
         return float(asks[0]["price"]), float(asks[0].get("size", 0))
     except (KeyError, ValueError, TypeError):
         return None, None
+
+
+def _get_outcome_prices(market: dict) -> tuple[float | None, float | None]:
+    """
+    Extract (yes_price, no_price) from the market's `outcomePrices` field.
+
+    This is the aggregate / AMM-pool price, which is the ACTUAL tradeable
+    price for most Polymarket markets — not the CLOB best ask, which is
+    usually an empty-book placeholder (0.001 / 0.999).
+
+    Handles both shapes:
+      - `outcomePrices` as JSON string (real Gamma API): '["0.72", "0.28"]'
+      - `outcomePrices` as list (test fixture)
+    Requires `outcomes` to order the prices correctly (YES first, NO second).
+    """
+    prices_raw = market.get("outcomePrices")
+    outcomes_raw = market.get("outcomes")
+    if not prices_raw or not outcomes_raw:
+        return None, None
+    try:
+        prices = json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
+        outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
+    except (ValueError, TypeError):
+        return None, None
+    if not isinstance(prices, list) or not isinstance(outcomes, list):
+        return None, None
+    if len(prices) != 2 or len(outcomes) != 2:
+        return None, None
+
+    yes_price = None
+    no_price = None
+    for outcome, price in zip(outcomes, prices):
+        if not isinstance(outcome, str):
+            continue
+        try:
+            p = float(price)
+        except (ValueError, TypeError):
+            continue
+        if outcome.upper() == "YES":
+            yes_price = p
+        elif outcome.upper() == "NO":
+            no_price = p
+    return yes_price, no_price
 
 
 def _opportunity_id(market_id: str, side: str, kind: str) -> str:
@@ -173,9 +222,13 @@ def _scan_for_longshot(
     """
     Shared scan implementation for longshot_fade and resolution_short.
 
-    Logic: fetch YES and NO order books. If EITHER side's best ask is below
-    `max_ask`, that side is a deep longshot and we fade it by buying the
-    OPPOSITE side at (1 - longshot_ask) ≈ high price.
+    Uses `outcomePrices` from the market metadata (aggregate / AMM pool
+    price), NOT CLOB best asks — most Polymarket CLOBs for top markets
+    are empty 0.001/0.999 placeholders and real liquidity flows through
+    the AMM pool layer.
+
+    Logic: if either YES or NO aggregate price is below `max_ask`, that
+    side is a deep longshot and we fade it by buying the OPPOSITE side.
     """
     # Liquidity filter
     liquidity = float(market.get("liquidity") or 0)
@@ -193,19 +246,16 @@ def _scan_for_longshot(
     if not yes_id or not no_id:
         return None
 
-    yes_book = fetch_clob_book(yes_id)
-    no_book = fetch_clob_book(no_id)
-    yes_ask, yes_size = _best_ask(yes_book)
-    no_ask, no_size = _best_ask(no_book)
-
-    if yes_ask is None or no_ask is None:
+    yes_price, no_price = _get_outcome_prices(market)
+    if yes_price is None or no_price is None:
         return None
 
     # Determine which side (if any) is a deep longshot
-    yes_is_longshot = yes_ask < max_ask
-    no_is_longshot = no_ask < max_ask
+    yes_is_longshot = yes_price < max_ask
+    no_is_longshot = no_price < max_ask
 
-    # If both sides show a deep longshot, the book is broken — skip
+    # If both sides are below the longshot threshold, something is wrong
+    # (either a resolved market or a broken price feed)
     if yes_is_longshot and no_is_longshot:
         return None
     if not yes_is_longshot and not no_is_longshot:
@@ -213,20 +263,16 @@ def _scan_for_longshot(
 
     if yes_is_longshot:
         longshot_side = "YES"
-        longshot_ask = yes_ask
-        # Fade by buying NO at its best ask (not 1 - yes_ask, because book prices
-        # are set independently and may diverge slightly)
+        longshot_ask = yes_price
         fade_side = "NO"
-        fade_entry_price = no_ask
-        fade_size = no_size
+        fade_entry_price = no_price
     else:
         longshot_side = "NO"
-        longshot_ask = no_ask
+        longshot_ask = no_price
         fade_side = "YES"
-        fade_entry_price = yes_ask
-        fade_size = yes_size
+        fade_entry_price = yes_price
 
-    # Sanity: fade entry must leave some remaining edge to target
+    # Sanity: fade entry must leave at least 1% remaining edge
     if fade_entry_price <= 0 or fade_entry_price >= 0.99:
         return None
 
@@ -238,7 +284,7 @@ def _scan_for_longshot(
         longshot_side=longshot_side,
         longshot_ask=longshot_ask,
         fade_entry_price=fade_entry_price,
-        fade_size=fade_size,
+        fade_size=0.0,  # not applicable when using aggregate prices
         yes_token_id=yes_id,
         no_token_id=no_id,
         days_to_end=days_to_end,
