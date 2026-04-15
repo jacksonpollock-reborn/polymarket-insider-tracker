@@ -23,7 +23,7 @@ import logging
 import os
 from datetime import datetime, timezone
 
-from src.fetchers import fetch_clob_book
+from src.fetchers import fetch_clob_book, extract_market_tokens
 
 log = logging.getLogger(__name__)
 
@@ -48,7 +48,13 @@ def _get_market_end_days(market: dict) -> float | None:
             return float(cached)
         except (TypeError, ValueError):
             pass
-    end_raw = market.get("end_date_iso") or market.get("endDate") or market.get("end_date")
+    # Real Gamma API uses endDateIso / endDate; tests may use end_date_iso
+    end_raw = (
+        market.get("endDateIso")
+        or market.get("end_date_iso")
+        or market.get("endDate")
+        or market.get("end_date")
+    )
     if not end_raw:
         return None
     try:
@@ -64,16 +70,6 @@ def _get_market_end_days(market: dict) -> float | None:
         return delta.total_seconds() / 86400.0
     except Exception:
         return None
-
-
-def _extract_tokens(market: dict) -> tuple[dict | None, dict | None]:
-    """Return (yes_token, no_token) from market.tokens list, or (None, None)."""
-    tokens = market.get("tokens") or []
-    if len(tokens) < 2:
-        return None, None
-    yes_tok = next((t for t in tokens if str(t.get("outcome", "")).upper() == "YES"), None)
-    no_tok = next((t for t in tokens if str(t.get("outcome", "")).upper() == "NO"), None)
-    return yes_tok, no_tok
 
 
 def _best_ask(book: dict) -> tuple[float | None, float | None]:
@@ -117,7 +113,12 @@ def _build_opportunity(
     category = market.get("_detected_category", "Other")
     alert_id = _opportunity_id(market_id, fade_side, kind)
 
-    end_raw = market.get("end_date_iso") or market.get("endDate") or market.get("end_date")
+    end_raw = (
+        market.get("endDateIso")
+        or market.get("end_date_iso")
+        or market.get("endDate")
+        or market.get("end_date")
+    )
     market_end = ""
     if isinstance(end_raw, str):
         market_end = end_raw[:10]
@@ -188,11 +189,7 @@ def _scan_for_longshot(
     if days_to_end < min_days or days_to_end > max_days:
         return None
 
-    yes_tok, no_tok = _extract_tokens(market)
-    if not yes_tok or not no_tok:
-        return None
-    yes_id = yes_tok.get("token_id") or yes_tok.get("tokenId")
-    no_id = no_tok.get("token_id") or no_tok.get("tokenId")
+    yes_id, no_id = extract_market_tokens(market)
     if not yes_id or not no_id:
         return None
 

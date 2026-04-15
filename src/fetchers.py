@@ -341,6 +341,59 @@ def estimate_taker_fee(shares: float, price: float, category: str = "Other") -> 
     rate = TAKER_FEE_RATES.get(category, 0.05)
     return shares * rate * price * (1 - price)
 
+
+def extract_market_tokens(market: dict) -> tuple[str | None, str | None]:
+    """
+    Extract (yes_token_id, no_token_id) from a Polymarket market dict.
+
+    Handles two shapes:
+      1. Real API response from fetch_active_markets: `outcomes` and
+         `clobTokenIds` are JSON-encoded strings.
+      2. Test/synthetic shape: `tokens` is a list of {outcome, token_id}
+         dicts (used by unit tests and some internal helpers).
+
+    Returns (None, None) if the market doesn't have a standard YES/NO pair.
+    """
+    # Shape 2: test/synthetic
+    tokens = market.get("tokens")
+    if isinstance(tokens, list) and len(tokens) >= 2:
+        yes_tok = next((t for t in tokens if str(t.get("outcome", "")).upper() == "YES"), None)
+        no_tok = next((t for t in tokens if str(t.get("outcome", "")).upper() == "NO"), None)
+        if yes_tok and no_tok:
+            return (
+                yes_tok.get("token_id") or yes_tok.get("tokenId"),
+                no_tok.get("token_id") or no_tok.get("tokenId"),
+            )
+
+    # Shape 1: real API
+    outcomes_raw = market.get("outcomes")
+    token_ids_raw = market.get("clobTokenIds")
+    if not outcomes_raw or not token_ids_raw:
+        return None, None
+    try:
+        import json as _json
+        outcomes = _json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
+        token_ids = _json.loads(token_ids_raw) if isinstance(token_ids_raw, str) else token_ids_raw
+    except (ValueError, TypeError):
+        return None, None
+    if not isinstance(outcomes, list) or not isinstance(token_ids, list):
+        return None, None
+    if len(outcomes) != 2 or len(token_ids) != 2:
+        return None, None
+
+    yes_id = None
+    no_id = None
+    for outcome, tid in zip(outcomes, token_ids):
+        if not isinstance(outcome, str) or not isinstance(tid, str):
+            continue
+        if outcome.upper() == "YES":
+            yes_id = tid
+        elif outcome.upper() == "NO":
+            no_id = tid
+    if yes_id and no_id:
+        return yes_id, no_id
+    return None, None
+
 def fetch_clob_book(token_id: str) -> dict:
     """
     Fetch the live order book for a single token from Polymarket's CLOB.
@@ -365,18 +418,7 @@ def scan_market_for_arb(market: dict, near_miss_threshold: float | None = None) 
     with is_near_miss=True. These are observability signals — we don't
     paper-trade them, but we want to know they exist.
     """
-    tokens = market.get("tokens") or []
-    if len(tokens) < 2:
-        return None
-
-    yes_token = next((t for t in tokens if str(t.get("outcome", "")).upper() == "YES"), None)
-    no_token  = next((t for t in tokens if str(t.get("outcome", "")).upper() == "NO"),  None)
-
-    if not yes_token or not no_token:
-        return None
-
-    yes_id = yes_token.get("token_id") or yes_token.get("tokenId")
-    no_id  = no_token.get("token_id")  or no_token.get("tokenId")
+    yes_id, no_id = extract_market_tokens(market)
     if not yes_id or not no_id:
         return None
 

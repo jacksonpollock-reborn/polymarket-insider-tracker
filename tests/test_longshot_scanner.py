@@ -122,6 +122,26 @@ class TestLongshotFade(unittest.TestCase):
             r2 = scan_market_for_longshot(market)
         self.assertEqual(r1["alert_id"], r2["alert_id"])
 
+    def test_parses_real_gamma_api_shape(self):
+        """Real Polymarket API returns clobTokenIds + outcomes as JSON strings, not a tokens list."""
+        end_dt = datetime.now(timezone.utc) + timedelta(days=10)
+        market = {
+            "conditionId": "0xabc",
+            "question": "Will X happen by April 30?",
+            "liquidity": 10_000.0,
+            "endDateIso": end_dt.isoformat(),
+            # This is the SHAPE the real Gamma API returns
+            "outcomes": '["Yes", "No"]',
+            "clobTokenIds": '["yes-token-12345", "no-token-67890"]',
+        }
+        with patch.object(longshot_scanner, "fetch_clob_book", side_effect=_mock_clob(0.08, 0.93)):
+            result = scan_market_for_longshot(market)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["longshot_side"], "YES")
+        self.assertEqual(result["suggested_outcome"], "NO")
+        self.assertEqual(result["yes_token_id"], "yes-token-12345")
+        self.assertEqual(result["no_token_id"], "no-token-67890")
+
     def test_synthetic_alert_shape_has_all_paper_trader_fields(self):
         """Scanner output must be usable directly as a paper_trader alert."""
         market = _make_market()
