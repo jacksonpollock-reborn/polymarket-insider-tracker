@@ -73,17 +73,48 @@ class TestLongshotFade(unittest.TestCase):
         result = scan_market_for_longshot(market)
         self.assertIsNone(result)
 
-    def test_returns_opportunity_when_yes_is_deep_longshot(self):
-        """YES is a deep longshot at 0.08 → we buy NO."""
-        market = _make_market(yes_price=0.08, no_price=0.93)
+    def test_returns_opportunity_when_yes_is_in_longshot_band(self):
+        """YES at 0.08 is inside [0.05, 0.15) longshot band → we buy NO."""
+        market = _make_market(yes_price=0.08, no_price=0.92)
         result = scan_market_for_longshot(market)
         self.assertIsNotNone(result)
         self.assertEqual(result["kind"], "longshot_fade")
         self.assertEqual(result["best_bucket"], "longshot_fade")
         self.assertEqual(result["longshot_side"], "YES")
         self.assertEqual(result["suggested_outcome"], "NO")
-        self.assertEqual(result["fade_entry_price"], 0.93)
-        self.assertAlmostEqual(result["shared_features"]["remaining_edge_pct"], 0.07, places=4)
+        self.assertEqual(result["fade_entry_price"], 0.92)
+        self.assertAlmostEqual(result["shared_features"]["remaining_edge_pct"], 0.08, places=4)
+
+    def test_skips_when_longshot_below_min_ask(self):
+        """Longshots below 0.05 get rejected — fade entry would be >= 0.95 (too thin)."""
+        market = _make_market(yes_price=0.02, no_price=0.98)
+        result = scan_market_for_longshot(market)
+        self.assertIsNone(result)
+
+    def test_skips_when_longshot_above_max_ask(self):
+        """Prices >= 0.15 are not longshots."""
+        market = _make_market(yes_price=0.20, no_price=0.80)
+        result = scan_market_for_longshot(market)
+        self.assertIsNone(result)
+
+    def test_fade_entry_stays_within_tradeable_band(self):
+        """For any valid longshot hit, fade_entry_price must be in [0.85, 0.95]."""
+        for longshot_side, longshot_price in [("YES", 0.06), ("YES", 0.10), ("YES", 0.14),
+                                                ("NO", 0.06), ("NO", 0.10), ("NO", 0.14)]:
+            if longshot_side == "YES":
+                market = _make_market(yes_price=longshot_price, no_price=1 - longshot_price)
+            else:
+                market = _make_market(yes_price=1 - longshot_price, no_price=longshot_price)
+            result = scan_market_for_longshot(market)
+            self.assertIsNotNone(result, f"Failed to fire on {longshot_side}={longshot_price}")
+            fade_entry = result["fade_entry_price"]
+            self.assertGreaterEqual(fade_entry, 0.85,
+                f"Fade entry {fade_entry} below 0.85 for {longshot_side}={longshot_price}")
+            self.assertLess(fade_entry, 0.96,
+                f"Fade entry {fade_entry} above 0.95 for {longshot_side}={longshot_price}")
+            # Must also pass the paper_trader floor (remaining_edge >= 0.05)
+            self.assertGreaterEqual(result["shared_features"]["remaining_edge_pct"], 0.05,
+                f"Remaining edge too low for paper_trader at {longshot_side}={longshot_price}")
 
     def test_returns_opportunity_when_no_is_deep_longshot(self):
         """NO is a deep longshot at 0.10 → we buy YES."""
@@ -106,8 +137,8 @@ class TestLongshotFade(unittest.TestCase):
         self.assertIsNone(result)
 
     def test_skips_too_distant_markets(self):
-        """days_to_end > 30 is above longshot_fade maximum."""
-        market = _make_market(days_to_end=60.0, yes_price=0.08, no_price=0.93)
+        """days_to_end > 180 is above longshot_fade maximum."""
+        market = _make_market(days_to_end=200.0, yes_price=0.08, no_price=0.92)
         result = scan_market_for_longshot(market)
         self.assertIsNone(result)
 

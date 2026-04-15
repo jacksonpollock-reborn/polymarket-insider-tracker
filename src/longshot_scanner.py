@@ -29,12 +29,23 @@ from src.fetchers import fetch_clob_book, extract_market_tokens
 log = logging.getLogger(__name__)
 
 # ── Longshot fade params ──────────────────────────────────────────────────────
-LONGSHOT_FADE_MAX_ASK = float(os.environ.get("LONGSHOT_FADE_MAX_ASK", "0.12"))
+# We target a longshot band, not just a max. Longshots below 0.05 have nearly
+# zero remaining edge after we fade (remaining_edge ≈ longshot_ask), so they
+# get silently rejected by paper_trader.PAPER_MIN_REMAINING_EDGE. The band
+# [0.05, 0.15] means fade entries land in [0.85, 0.95] — actually tradeable.
+LONGSHOT_FADE_MIN_ASK = float(os.environ.get("LONGSHOT_FADE_MIN_ASK", "0.05"))
+LONGSHOT_FADE_MAX_ASK = float(os.environ.get("LONGSHOT_FADE_MAX_ASK", "0.15"))
 LONGSHOT_FADE_MIN_LIQUIDITY = float(os.environ.get("LONGSHOT_FADE_MIN_LIQUIDITY", "5000"))
 LONGSHOT_FADE_MIN_DAYS = float(os.environ.get("LONGSHOT_FADE_MIN_DAYS", "1"))
-LONGSHOT_FADE_MAX_DAYS = float(os.environ.get("LONGSHOT_FADE_MAX_DAYS", "30"))
+# Long-dated markets are where the 5-15% longshot band actually lives on
+# Polymarket. Near-term markets in that band are rare (most are already
+# resolved or still 50/50). 180 days = ~6 months, a reasonable upper bound.
+LONGSHOT_FADE_MAX_DAYS = float(os.environ.get("LONGSHOT_FADE_MAX_DAYS", "180"))
 
 # ── Resolution proximity short params ─────────────────────────────────────────
+# Same band concept: only catch longshots that produce fade entries the paper
+# trader will actually trade.
+RESOLUTION_SHORT_MIN_ASK = float(os.environ.get("RESOLUTION_SHORT_MIN_ASK", "0.05"))
 RESOLUTION_SHORT_MAX_ASK = float(os.environ.get("RESOLUTION_SHORT_MAX_ASK", "0.15"))
 RESOLUTION_SHORT_MIN_LIQUIDITY = float(os.environ.get("RESOLUTION_SHORT_MIN_LIQUIDITY", "3000"))
 RESOLUTION_SHORT_MIN_DAYS = float(os.environ.get("RESOLUTION_SHORT_MIN_DAYS", "0.5"))
@@ -214,6 +225,7 @@ def _scan_for_longshot(
     market: dict,
     *,
     kind: str,
+    min_ask: float,
     max_ask: float,
     min_liquidity: float,
     min_days: float,
@@ -250,12 +262,13 @@ def _scan_for_longshot(
     if yes_price is None or no_price is None:
         return None
 
-    # Determine which side (if any) is a deep longshot
-    yes_is_longshot = yes_price < max_ask
-    no_is_longshot = no_price < max_ask
+    # Longshot band: min_ask < longshot < max_ask.
+    # Below min_ask: fade entry is too close to 1.00 to leave tradeable edge.
+    # Above max_ask: not a longshot, no bias to exploit.
+    yes_is_longshot = min_ask <= yes_price < max_ask
+    no_is_longshot = min_ask <= no_price < max_ask
 
-    # If both sides are below the longshot threshold, something is wrong
-    # (either a resolved market or a broken price feed)
+    # Can't have both sides in the longshot band simultaneously (prices sum to ~1)
     if yes_is_longshot and no_is_longshot:
         return None
     if not yes_is_longshot and not no_is_longshot:
@@ -296,6 +309,7 @@ def scan_market_for_longshot(market: dict) -> dict | None:
     return _scan_for_longshot(
         market,
         kind="longshot_fade",
+        min_ask=LONGSHOT_FADE_MIN_ASK,
         max_ask=LONGSHOT_FADE_MAX_ASK,
         min_liquidity=LONGSHOT_FADE_MIN_LIQUIDITY,
         min_days=LONGSHOT_FADE_MIN_DAYS,
@@ -308,6 +322,7 @@ def scan_market_for_resolution_short(market: dict) -> dict | None:
     return _scan_for_longshot(
         market,
         kind="resolution_short",
+        min_ask=RESOLUTION_SHORT_MIN_ASK,
         max_ask=RESOLUTION_SHORT_MAX_ASK,
         min_liquidity=RESOLUTION_SHORT_MIN_LIQUIDITY,
         min_days=RESOLUTION_SHORT_MIN_DAYS,
