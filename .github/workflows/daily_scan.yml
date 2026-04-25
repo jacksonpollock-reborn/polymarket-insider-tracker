@@ -48,6 +48,10 @@ jobs:
           GMAIL_APP_PASSWORD:   ${{ secrets.GMAIL_APP_PASSWORD }}
           EMAIL_TO:             ${{ secrets.EMAIL_TO }}
           MAX_WALLETS_TO_SCORE: "60"
+          # sports_news bucket disabled (paper P&L: -$32.90, 22% WR).
+          # Set unreachable threshold so no sports_news alert can enter the watchlist
+          # or open paper positions. Re-tune by lowering this value once strategy improves.
+          MIN_SPORTS_CONFIDENCE: "999"
           NEAR_MISS_ARB_THRESHOLD: "0.98"
           LONGSHOT_FADE_MIN_ASK: "0.05"
           LONGSHOT_FADE_MAX_ASK: "0.15"
