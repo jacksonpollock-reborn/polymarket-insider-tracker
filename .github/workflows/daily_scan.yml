@@ -3,8 +3,6 @@ name: Polymarket Strategy Tracker
 on:
   schedule:
   - cron: "0 1 * * *"   # 台北時間 09:00
-  - cron: "0 8 * * *"   # 台北時間 16:00
-  - cron: "0 14 * * *"  # 台北時間 22:00
   workflow_dispatch:
 
 jobs:
